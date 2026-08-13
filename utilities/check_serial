@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""Verify Septentrio USB serial aliases and receiver connectivity."""
+
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+try:
+    import serial
+except ImportError:
+    print(
+        "pyserial is required. Install it with:\n"
+        "  sudo apt install python3-serial\n"
+        "  # or: pip install pyserial",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+LAUNCH_DIR = Path(__file__).resolve().parent.parent / "launch"
+
+
+def _launch_dir() -> Path:
+    candidates = [LAUNCH_DIR]
+    try:
+        from ament_index_python.packages import get_package_share_directory
+
+        candidates.append(
+            Path(get_package_share_directory("usv_rtk_bringup")) / "launch"
+        )
+    except Exception:
+        pass
+    for path in candidates:
+        if (path / "vehicle_config.py").exists():
+            return path
+    return LAUNCH_DIR
+
+
+if str(_launch_dir()) not in sys.path:
+    sys.path.insert(0, str(_launch_dir()))
+
+from vehicle_config import default_vehicle_config_path, load_vehicle_config, resolve_network  # noqa: E402
+
+ENTER_COMMAND_MODE = b"\x0DSSSSSSSSSS\x0D\x0D"
+USB_VENDOR_PRODUCT = "152a:8231"
+
+
+def default_vehicle_config() -> Path:
+    try:
+        return Path(default_vehicle_config_path())
+    except Exception:
+        return Path(__file__).resolve().parent.parent / "config" / "usv.yaml"
+
+
+def load_serial_config(path: Path) -> dict:
+    config = load_vehicle_config(path)
+    return resolve_network(config, {})
+
+
+def run_command(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, capture_output=True, text=True, check=False)
+
+
+def udev_properties(device: Path) -> dict[str, str]:
+    result = run_command(["udevadm", "info", "-q", "property", "-n", str(device)])
+    if result.returncode != 0:
+        return {}
+    return {
+        line.split("=", 1)[0]: line.split("=", 1)[1]
+        for line in result.stdout.splitlines()
+        if "=" in line
+    }
+
+
+def port_holders(device: Path) -> list[str]:
+    result = run_command(["fuser", str(device)])
+    text = (result.stdout or result.stderr).strip()
+    if not text:
+        return []
+    return text.split()
+
+
+def stty_speed(device: Path) -> str:
+    result = run_command(["stty", "-F", str(device), "-a"])
+    if result.returncode != 0:
+        return "unknown"
+    for token in result.stdout.split(";"):
+        if "speed" in token:
+            return token.strip()
+    return "unknown"
+
+
+def symlink_info(device: Path) -> tuple[str, str]:
+    if device.is_symlink():
+        target = device.resolve()
+        return device.readlink(), str(target)
+    return "(not a symlink)", str(device.resolve())
+
+
+def send_command(
+    ser: serial.Serial,
+    command: str,
+    *,
+    enter_command_mode: bool = False,
+    wait: float = 0.8,
+) -> tuple[bool, list[str], bytes]:
+    if enter_command_mode:
+        ser.reset_input_buffer()
+        ser.write(ENTER_COMMAND_MODE)
+        ser.flush()
+        time.sleep(0.3)
+        ser.read(4096)
+
+    ser.reset_input_buffer()
+    payload = command if command.endswith("\r") else f"{command}\r"
+    ser.write(payload.encode())
+    ser.flush()
+    time.sleep(wait)
+    data = ser.read(200000)
+
+    text = data.decode("ascii", errors="replace").replace("\r", "\n")
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    errors = [line for line in lines if line.startswith("$R?")]
+    useful = [
+        line
+        for line in lines
+        if not line.startswith("$R;")
+        and "USB" not in line[:4]
+        and not line.endswith(">")
+    ]
+    return not errors, useful, data
+
+
+def parse_gri(lines: list[str]) -> dict[str, str]:
+    info: dict[str, str] = {}
+    for line in lines:
+        match = re.match(
+            r'ReceiverInterface,\s*([^,]+),\s*"(.*)"\s*$',
+            line,
+        )
+        if match:
+            info[match.group(1)] = match.group(2)
+    return info
+
+
+def sniff_nmea(device: Path, baud: int, seconds: float) -> list[str]:
+    ser = serial.Serial(str(device), baud, timeout=0.2)
+    deadline = time.monotonic() + seconds
+    data = b""
+    while time.monotonic() < deadline:
+        data += ser.read(8192)
+        time.sleep(0.05)
+    ser.close()
+    return [
+        line.decode("ascii", errors="replace")
+        for line in data.split(b"\r\n")
+        if line.startswith(b"$")
+    ]
+
+
+def print_port_header(title: str, device: Path) -> None:
+    print(f"\n{'─' * 72}")
+    print(title)
+    print(f"  Device: {device}")
+
+
+def check_port(
+    *,
+    title: str,
+    device: Path,
+    baud: int,
+    enter_command_mode: bool,
+    query: bool,
+    failures: list[str],
+) -> dict[str, str]:
+    print_port_header(title, device)
+
+    if not device.exists():
+        msg = f"{device} does not exist"
+        print(f"  MISSING: {msg}")
+        failures.append(msg)
+        return {}
+
+    link, resolved = symlink_info(device)
+    print(f"  Symlink:   {link}")
+    print(f"  Resolves:  {resolved}")
+
+    props = udev_properties(device)
+    for key in ("ID_SERIAL_SHORT", "ID_USB_INTERFACE_NUM", "ID_VENDOR_ID", "ID_MODEL_ID"):
+        if key in props:
+            print(f"  {key}: {props[key]}")
+
+    holders = port_holders(device)
+    print(f"  Holder(s): {', '.join(holders) if holders else 'none'}")
+    print(f"  Line:      {stty_speed(device)}")
+
+    if not query:
+        print("  Query:     skipped")
+        return {}
+
+    try:
+        ser = serial.Serial(str(device), baud, timeout=0.5)
+    except serial.SerialException as exc:
+        msg = f"{device} open failed: {exc}"
+        print(f"  OPEN: FAILED — {exc}")
+        failures.append(msg)
+        return {}
+
+    print(f"  OPEN @ {baud}: OK")
+
+    ok, lines, _ = send_command(ser, "gri", enter_command_mode=enter_command_mode)
+    ser.close()
+
+    if not ok:
+        msg = f"{device} admin query failed"
+        print(f"  Query: FAILED")
+        for line in lines[:3]:
+            print(f"    {line}")
+        failures.append(msg)
+        return {}
+
+    info = parse_gri(lines)
+    if info:
+        print("  Receiver:")
+        for key in ("RxName", "SNMPVersion", "SNMPLanguage"):
+            if key in info:
+                label = "Firmware" if key == "SNMPVersion" else key
+                print(f"    {label}: {info[key]}")
+    else:
+        print("  Query: OK (no ReceiverInterface fields parsed)")
+        for line in lines[:5]:
+            print(f"    {line}")
+
+    return info
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--vehicle-config",
+        type=Path,
+        default=default_vehicle_config(),
+        help="vehicle YAML with serial device paths (default: installed or package usv.yaml)",
+    )
+    parser.add_argument(
+        "--skip-main-query",
+        action="store_true",
+        help="skip admin queries on the main port (use when the GNSS driver holds it)",
+    )
+    parser.add_argument(
+        "--nmea-seconds",
+        type=float,
+        default=2.0,
+        help="seconds to listen for NMEA on the aux port (0 disables)",
+    )
+    args = parser.parse_args()
+
+    try:
+        network = load_serial_config(args.vehicle_config)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
+
+    main_device = Path(network["serial_device"])
+    aux_device = Path(network["aux_serial_device"])
+    main_baud = int(network["serial_baudrate"])
+    aux_baud = int(network["aux_serial_baudrate"])
+
+    failures: list[str] = []
+
+    print("=" * 72)
+    print("USV RTK serial check")
+    print("=" * 72)
+
+    usb = run_command(["lsusb", "-d", USB_VENDOR_PRODUCT])
+    if usb.stdout.strip():
+        print(f"\nUSB: {usb.stdout.strip()}")
+    else:
+        msg = f"Septentrio USB device {USB_VENDOR_PRODUCT} not found"
+        print(f"\nWARN: {msg}")
+        failures.append(msg)
+
+    main_holders = port_holders(main_device)
+    main_info = check_port(
+        title="Main (/dev/usv-rtk ↔ USB1)",
+        device=main_device,
+        baud=main_baud,
+        enter_command_mode=True,
+        query=not args.skip_main_query and not main_holders,
+        failures=failures,
+    )
+
+    aux_info = check_port(
+        title="Aux (/dev/usv-rtk-aux ↔ USB2)",
+        device=aux_device,
+        baud=aux_baud,
+        enter_command_mode=False,
+        query=True,
+        failures=failures,
+    )
+
+    if main_holders and not args.skip_main_query:
+        print("\nNote: main port is in use; admin query skipped. "
+              "Use --skip-main-query or stop the GNSS driver to query /dev/usv-rtk.")
+
+    info = aux_info or main_info
+    if info.get("RxName"):
+        print("\nSummary:")
+        print(f"  Model:    {info.get('RxName', '?')}")
+        print(f"  Firmware: {info.get('SNMPVersion', '?')}")
+        print(f"  Serial:   {udev_properties(main_device).get('ID_SERIAL_SHORT', '?')}")
+
+    if args.nmea_seconds > 0:
+        print(f"\nAux NMEA listen ({args.nmea_seconds:.1f}s @ {aux_baud}):")
+        if not aux_device.exists():
+            print("  skipped (aux device missing)")
+        else:
+            try:
+                sentences = sniff_nmea(aux_device, aux_baud, args.nmea_seconds)
+            except serial.SerialException as exc:
+                msg = f"aux NMEA listen failed: {exc}"
+                print(f"  FAIL: {exc}")
+                failures.append(msg)
+            else:
+                print(f"  sentences: {len(sentences)}")
+                if sentences:
+                    for sentence in sentences[:3]:
+                        print(f"    {sentence[:100]}")
+                else:
+                    msg = "no NMEA on aux (launch gnss.launch.py or check gnss_aux_nmea.cmd)"
+                    print(f"  WARN: {msg}")
+                    failures.append(msg)
+
+    print(f"\n{'=' * 72}")
+    if failures:
+        print("Result: FAIL")
+        for item in failures:
+            print(f"  - {item}")
+        return 1
+
+    print("Result: OK")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

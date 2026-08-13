@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""NTRIP client on the aux serial port — GGA-gated, pygnssutils-backed."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from queue import Empty, Queue
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ntrip_secrets import default_secrets_path, load_ntrip_config  # noqa: E402
+
+try:
+    import serial
+    from pynmeagps import NMEAReader
+    from pygnssutils.globals import FIXTYPE_GGA
+    from pygnssutils.gnssntripclient import GNSSNTRIPClient
+except ImportError:
+    print(
+        "Dependencies: pyserial, pygnssutils (pulls in pynmeagps, pyrtcm).\n"
+        "  python3 -m pip install pyserial pygnssutils",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+GGALIVE = 0
+MIN_FIX_QUALITY = 1
+
+
+def default_vehicle_config() -> Path:
+    repo_config = Path(__file__).resolve().parent.parent / "config" / "usv.yaml"
+    if repo_config.exists():
+        return repo_config
+    return Path("config/usv.yaml")
+
+
+def load_aux_serial(vehicle_config: Path) -> tuple[str, int]:
+    import yaml
+
+    with open(vehicle_config, encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+    network = config.get("network", {})
+    device = network.get("aux_serial_device", "/dev/usv-rtk-aux")
+    baud = int(network.get("aux_serial_baudrate", 115200))
+    return device, baud
+
+
+def ntrip_version(version: str) -> str:
+    version = version.strip().lower()
+    if version in {"v2", "2", "2.0"}:
+        return "2.0"
+    if version in {"v1", "1", "1.0"}:
+        return "1.0"
+    return version
+
+
+def port_holder_pids(device: Path) -> list[int]:
+    result = subprocess.run(
+        ["fuser", str(device)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    text = (result.stdout or result.stderr).strip()
+    if not text:
+        return []
+    return [int(token) for token in text.split() if token.isdigit()]
+
+
+def holder_command(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return "?"
+    return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip() or "?"
+
+
+def release_serial_port(device: Path, *, my_pid: int | None = None) -> list[int]:
+    """Terminate other processes holding the serial device."""
+    if my_pid is None:
+        my_pid = os.getpid()
+
+    released: list[int] = []
+    for pid in port_holder_pids(device):
+        if pid == my_pid:
+            continue
+        cmd = holder_command(pid)
+        logging.warning("Releasing %s: SIGTERM PID %d (%s)", device, pid, cmd)
+        os.kill(pid, signal.SIGTERM)
+        released.append(pid)
+
+    if not released:
+        return released
+
+    time.sleep(0.5)
+    for pid in port_holder_pids(device):
+        if pid == my_pid:
+            continue
+        logging.warning("Releasing %s: SIGKILL PID %d", device, pid)
+        os.kill(pid, signal.SIGKILL)
+    time.sleep(0.2)
+    return released
+
+
+def print_startup_config(
+    *,
+    ntrip_cfg: dict,
+    secrets_path: Path,
+    vehicle_config: Path,
+    device: Path,
+    baud: int,
+    gga_interval: int,
+    gga_max_age: float,
+    lost_fix_grace: float,
+    release_port: bool,
+    publish_rtcm: bool,
+    rtcm_topic: str,
+    rtcm_frame_id: str,
+    verbosity: int,
+) -> None:
+    version = ntrip_version(ntrip_cfg.get("version", "v2"))
+    print("ntrip_aux_client — configuration")
+    print(f"  secrets:          {secrets_path}")
+    print(f"  vehicle config:   {vehicle_config}")
+    print(f"  NTRIP caster:     {ntrip_cfg['caster']}:{ntrip_cfg['caster_port']}")
+    print(f"  mountpoint:       {ntrip_cfg['mountpoint']}")
+    print(f"  NTRIP version:    {version}")
+    print(f"  username:         {ntrip_cfg['username']}")
+    print("  password:         ***")
+    print(f"  aux serial:       {device} @ {baud}")
+    print(f"  GGA interval:     {gga_interval}s")
+    print(f"  GGA max age:      {gga_max_age}s")
+    print(f"  lost-fix grace:   {lost_fix_grace}s")
+    print(f"  min fix quality:  {MIN_FIX_QUALITY}")
+    print(f"  release port:     {release_port}")
+    print(f"  publish RTCM:     {publish_rtcm}")
+    if publish_rtcm:
+        print(f"  RTCM topic:       {rtcm_topic}")
+        print(f"  RTCM frame_id:    {rtcm_frame_id}")
+    print(f"  log verbosity:    {verbosity}")
+    print()
+
+
+@dataclass
+class GgaFix:
+    lat: float
+    lon: float
+    alt: float
+    sep: float
+    quality: int
+    num_sv: int
+    hdop: float
+    age: float
+    station: int
+    raw: bytes
+    updated_at: float
+
+    @property
+    def valid(self) -> bool:
+        return self.quality >= MIN_FIX_QUALITY
+
+    def fix_string(self) -> str:
+        return FIXTYPE_GGA.get(self.quality, "3D")
+
+    def as_coordinates(self) -> dict:
+        return {
+            "lat": self.lat,
+            "lon": self.lon,
+            "alt": self.alt,
+            "sep": self.sep,
+            "fix": self.fix_string(),
+            "sip": self.num_sv,
+            "hdop": self.hdop,
+            "diffage": self.age,
+            "diffstation": self.station,
+        }
+
+
+class GgaMonitor:
+    """Read NMEA from aux serial and track the latest GGA fix."""
+
+    def __init__(self, ser: serial.Serial):
+        self._ser = ser
+        self._lock = threading.Lock()
+        self._latest: GgaFix | None = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="gga-monitor", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def latest(self, max_age: float) -> GgaFix | None:
+        with self._lock:
+            if self._latest is None:
+                return None
+            if time.monotonic() - self._latest.updated_at > max_age:
+                return None
+            return self._latest
+
+    def _run(self) -> None:
+        reader = NMEAReader(self._ser, quitonerror=1)
+        while not self._stop.is_set():
+            try:
+                _raw, parsed = reader.read()
+            except (serial.SerialException, OSError):
+                break
+            if parsed is None or getattr(parsed, "msgID", "") != "GGA":
+                continue
+            quality = int(getattr(parsed, "quality", 0))
+            fix = GgaFix(
+                lat=float(parsed.lat),
+                lon=float(parsed.lon),
+                alt=float(getattr(parsed, "alt", 0.0) or 0.0),
+                sep=float(getattr(parsed, "sep", 0.0) or 0.0),
+                quality=quality,
+                num_sv=int(getattr(parsed, "numSV", 0) or 0),
+                hdop=float(getattr(parsed, "HDOP", 0.0) or 0.0),
+                age=float(getattr(parsed, "diffAge", 0.0) or 0.0),
+                station=int(getattr(parsed, "diffStation", 0) or 0),
+                raw=_raw if isinstance(_raw, (bytes, bytearray)) else bytes(_raw),
+                updated_at=time.monotonic(),
+            )
+            with self._lock:
+                self._latest = fix
+
+
+class NtripAuxApp:
+    """Calling app for GNSSNTRIPClient — supplies live GGA from GgaMonitor."""
+
+    def __init__(self, monitor: GgaMonitor, max_gga_age: float):
+        self._monitor = monitor
+        self._max_gga_age = max_gga_age
+
+    def get_coordinates(self) -> dict:
+        fix = self._monitor.latest(self._max_gga_age)
+        if fix is None or not fix.valid:
+            raise ValueError("no valid GGA")
+        return fix.as_coordinates()
+
+
+class RtcmRosPublisher:
+    """Publish RTCM bytes as rtcm_msgs/Message."""
+
+    def __init__(self, topic: str, frame_id: str):
+        try:
+            import rclpy
+            from rclpy.executors import SingleThreadedExecutor
+            from rtcm_msgs.msg import Message
+        except ImportError as exc:
+            raise RuntimeError(
+                "ROS2 publishing requires rclpy and rtcm_msgs "
+                "(ros-humble-rtcm-msgs or similar)"
+            ) from exc
+
+        self._Message = Message
+        if not rclpy.ok():
+            rclpy.init()
+        self._node = rclpy.create_node("ntrip_aux_client")
+        self._pub = self._node.create_publisher(Message, topic, 10)
+        self._frame_id = frame_id
+        self._executor = SingleThreadedExecutor()
+        self._executor.add_node(self._node)
+        self._thread = threading.Thread(target=self._executor.spin, daemon=True)
+        self._thread.start()
+        self._count = 0
+
+    def publish(self, raw: bytes, parsed: object = None) -> None:
+        msg = self._Message()
+        msg.header.stamp = self._node.get_clock().now().to_msg()
+        msg.header.frame_id = self._frame_id
+        msg.message = list(raw)
+        self._pub.publish(msg)
+        self._count += 1
+        if self._count == 1 or self._count % 100 == 0:
+            identity = getattr(parsed, "identity", "?")
+            logging.info(
+                "Published RTCM #%d (%s, %d bytes) on %s",
+                self._count,
+                identity,
+                len(raw),
+                self._pub.topic_name,
+            )
+
+    def shutdown(self) -> None:
+        import rclpy
+
+        self._executor.shutdown()
+        self._node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+class RtcmRelay:
+    """Write RTCM to serial and optionally publish to ROS."""
+
+    def __init__(
+        self,
+        ser: serial.Serial,
+        output_queue: Queue,
+        *,
+        ros_publisher: RtcmRosPublisher | None,
+        stop_event: threading.Event,
+    ):
+        self._ser = ser
+        self._queue = output_queue
+        self._ros = ros_publisher
+        self._stop = stop_event
+        self._thread = threading.Thread(target=self._run, name="rtcm-relay", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                raw, parsed = self._queue.get(timeout=0.5)
+            except Empty:
+                continue
+            if not isinstance(raw, (bytes, bytearray)):
+                continue
+            self._ser.write(raw)
+            if self._ros is not None:
+                self._ros.publish(bytes(raw), parsed)
+
+
+class NtripAuxBridge:
+    def __init__(
+        self,
+        *,
+        ntrip_cfg: dict,
+        device: Path,
+        baud: int,
+        gga_interval: int,
+        gga_max_age: float,
+        lost_fix_grace: float,
+        release_port: bool,
+        publish_rtcm: bool,
+        rtcm_topic: str,
+        rtcm_frame_id: str,
+        verbosity: int,
+    ):
+        self._ntrip_cfg = ntrip_cfg
+        self._device = device
+        self._baud = baud
+        self._gga_interval = gga_interval
+        self._gga_max_age = gga_max_age
+        self._lost_fix_grace = lost_fix_grace
+        self._release_port = release_port
+        self._publish_rtcm = publish_rtcm
+        self._rtcm_topic = rtcm_topic
+        self._rtcm_frame_id = rtcm_frame_id
+        self._verbosity = verbosity
+        self._stop = threading.Event()
+        self._client: GNSSNTRIPClient | None = None
+        self._connected_since: float | None = None
+        self._last_valid_gga: float | None = None
+        self._rtcm_queue: Queue | None = None
+        self._rtcm_relay: RtcmRelay | None = None
+        self._ros_publisher: RtcmRosPublisher | None = None
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._client is not None:
+            self._client.stop()
+
+    def _disconnect(self, reason: str) -> None:
+        if self._client is None:
+            return
+        logging.info("Stopping NTRIP: %s", reason)
+        self._client.stop()
+        self._client = None
+        self._connected_since = None
+
+    def _connect(self, app: NtripAuxApp, ser: serial.Serial) -> None:
+        cfg = self._ntrip_cfg
+        output: serial.Serial | Queue
+        if self._publish_rtcm:
+            assert self._rtcm_queue is not None
+            output = self._rtcm_queue
+        else:
+            output = ser
+
+        self._client = GNSSNTRIPClient(app, verbosity=self._verbosity)
+        self._client.run(
+            server=cfg["caster"],
+            port=cfg["caster_port"],
+            https=0,
+            mountpoint=cfg["mountpoint"],
+            datatype="RTCM",
+            version=ntrip_version(cfg.get("version", "v2")),
+            ntripuser=cfg["username"],
+            ntrippassword=cfg["password"],
+            ggainterval=self._gga_interval,
+            ggamode=GGALIVE,
+            output=output,
+            stopevent=self._client.stopevent,
+        )
+        self._connected_since = time.monotonic()
+        logging.info(
+            "NTRIP connected to %s:%s/%s",
+            cfg["caster"],
+            cfg["caster_port"],
+            cfg["mountpoint"],
+        )
+
+    def run(self) -> int:
+        if self._release_port:
+            released = release_serial_port(self._device)
+            if released:
+                logging.info(
+                    "Cleared %d holder(s) on %s: %s",
+                    len(released),
+                    self._device,
+                    ", ".join(str(pid) for pid in released),
+                )
+
+        if self._publish_rtcm:
+            try:
+                self._ros_publisher = RtcmRosPublisher(
+                    self._rtcm_topic,
+                    self._rtcm_frame_id,
+                )
+            except RuntimeError as exc:
+                logging.error("%s", exc)
+                return 1
+            self._rtcm_queue = Queue()
+            logging.info("ROS2 RTCM publishing enabled on %s", self._rtcm_topic)
+
+        try:
+            ser = serial.Serial(str(self._device), self._baud, timeout=1)
+        except serial.SerialException as exc:
+            holders = port_holder_pids(self._device)
+            hint = ""
+            if holders:
+                hint = f" (held by PIDs: {', '.join(str(p) for p in holders)})"
+            logging.error("Cannot open %s: %s%s", self._device, exc, hint)
+            return 1
+
+        if self._publish_rtcm and self._rtcm_queue is not None:
+            self._rtcm_relay = RtcmRelay(
+                ser,
+                self._rtcm_queue,
+                ros_publisher=self._ros_publisher,
+                stop_event=self._stop,
+            )
+            self._rtcm_relay.start()
+
+        monitor = GgaMonitor(ser)
+        app = NtripAuxApp(monitor, self._gga_max_age)
+        monitor.start()
+        logging.info(
+            "Listening for GGA on %s @ %d — NTRIP starts when fix quality >= %d",
+            self._device,
+            self._baud,
+            MIN_FIX_QUALITY,
+        )
+
+        try:
+            while not self._stop.is_set():
+                fix = monitor.latest(self._gga_max_age)
+                now = time.monotonic()
+
+                if fix is not None and fix.valid:
+                    self._last_valid_gga = now
+                    if self._client is None:
+                        self._connect(app, ser)
+                elif self._client is not None:
+                    last = self._last_valid_gga
+                    if last is None or (now - last) > self._lost_fix_grace:
+                        self._disconnect("GGA fix lost or stale")
+
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            logging.info("Interrupted")
+        finally:
+            self._disconnect("shutdown")
+            monitor.stop()
+            if self._rtcm_relay is not None:
+                self._rtcm_relay.stop()
+            ser.close()
+            if self._ros_publisher is not None:
+                self._ros_publisher.shutdown()
+
+        return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--secrets",
+        type=Path,
+        default=default_secrets_path(),
+        help="NTRIP credentials",
+    )
+    parser.add_argument(
+        "--vehicle-config",
+        type=Path,
+        default=default_vehicle_config(),
+        help="vehicle YAML for aux serial path/baud",
+    )
+    parser.add_argument(
+        "--device",
+        type=Path,
+        default=None,
+        help="override aux serial device",
+    )
+    parser.add_argument(
+        "--baud",
+        type=int,
+        default=None,
+        help="override aux serial baud rate",
+    )
+    parser.add_argument(
+        "--release-port",
+        action="store_true",
+        help="terminate other processes holding the aux serial device",
+    )
+    parser.add_argument(
+        "--gga-interval",
+        type=int,
+        default=10,
+        help="seconds between GGA sentences sent to the NTRIP caster",
+    )
+    parser.add_argument(
+        "--gga-max-age",
+        type=float,
+        default=5.0,
+        help="ignore GGA sentences older than this many seconds",
+    )
+    parser.add_argument(
+        "--lost-fix-grace",
+        type=float,
+        default=15.0,
+        help="disconnect NTRIP after this many seconds without valid GGA",
+    )
+    parser.add_argument(
+        "--publish-rtcm",
+        action="store_true",
+        help="publish received RTCM as rtcm_msgs/Message on ROS 2",
+    )
+    parser.add_argument(
+        "--rtcm-topic",
+        default="/rtcm",
+        help="ROS 2 topic for rtcm_msgs/Message",
+    )
+    parser.add_argument(
+        "--rtcm-frame-id",
+        default="gnss",
+        help="frame_id in RTCM message header",
+    )
+    parser.add_argument(
+        "--verbosity",
+        type=int,
+        default=1,
+        choices=[-1, 0, 1, 2, 3],
+        help="pygnssutils log verbosity",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    try:
+        ntrip_cfg = load_ntrip_config(args.secrets)
+        default_device, default_baud = load_aux_serial(args.vehicle_config)
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        logging.error("%s", exc)
+        return 1
+
+    device = args.device or Path(default_device)
+    baud = args.baud if args.baud is not None else default_baud
+
+    print_startup_config(
+        ntrip_cfg=ntrip_cfg,
+        secrets_path=args.secrets,
+        vehicle_config=args.vehicle_config,
+        device=device,
+        baud=baud,
+        gga_interval=args.gga_interval,
+        gga_max_age=args.gga_max_age,
+        lost_fix_grace=args.lost_fix_grace,
+        release_port=args.release_port,
+        publish_rtcm=args.publish_rtcm,
+        rtcm_topic=args.rtcm_topic,
+        rtcm_frame_id=args.rtcm_frame_id,
+        verbosity=args.verbosity,
+    )
+
+    bridge = NtripAuxBridge(
+        ntrip_cfg=ntrip_cfg,
+        device=device,
+        baud=baud,
+        gga_interval=args.gga_interval,
+        gga_max_age=args.gga_max_age,
+        lost_fix_grace=args.lost_fix_grace,
+        release_port=args.release_port,
+        publish_rtcm=args.publish_rtcm,
+        rtcm_topic=args.rtcm_topic,
+        rtcm_frame_id=args.rtcm_frame_id,
+        verbosity=args.verbosity,
+    )
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    return bridge.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

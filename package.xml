@@ -16,6 +16,8 @@
   <exec_depend>septentrio_gnss_driver</exec_depend>
   <exec_depend>rclcpp_components</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>rtcm_msgs</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

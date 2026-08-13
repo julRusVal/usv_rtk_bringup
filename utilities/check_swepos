@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""Verify SWEPOS NTRIP credentials and stream RTCM corrections."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import signal
+import socket
+import sys
+import threading
+import time
+from pathlib import Path
+from queue import Empty, Queue
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ntrip_secrets import default_secrets_path, load_ntrip_config  # noqa: E402
+
+try:
+    from pygnssutils.gnssntripclient import GNSSNTRIPClient
+except ImportError:
+    print(
+        "pygnssutils is required. Install it in a virtualenv, for example:\n"
+        "  python3 -m venv ~/.local/venvs/pygnssutils\n"
+        "  ~/.local/venvs/pygnssutils/bin/pip install pygnssutils",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+DEFAULT_PORTS = (80, 8500)
+FALLBACK_MOUNTPOINTS = (
+    "MSM_GEC",
+    "MSM_GNSS",
+    "MSM_GRE",
+    "RTCM3_GNSS",
+    "RTCM3_GPS",
+    "RTCM2_GPS",
+    "DGNSS",
+)
+GGAMODE_FIXED = 1  # fixed reference position (required for SWEPOS with reflat/reflon)
+
+
+def ntrip_version(version: str) -> str:
+    version = version.strip().lower()
+    if version in {"v2", "2", "2.0"}:
+        return "2.0"
+    if version in {"v1", "1", "1.0"}:
+        return "1.0"
+    return version
+
+
+def build_params(
+    cfg: dict,
+    *,
+    port: int | None = None,
+    mountpoint: str | None = None,
+    reflat: float,
+    reflon: float,
+    refalt: float,
+    ggainterval: int,
+) -> dict:
+    return {
+        "server": cfg["caster"],
+        "port": port if port is not None else cfg["caster_port"],
+        "https": 0,
+        "mountpoint": mountpoint if mountpoint is not None else cfg["mountpoint"],
+        "datatype": "RTCM",
+        "ntripversion": ntrip_version(cfg.get("version", "v2")),
+        "username": cfg["username"],
+        "password": cfg["password"],
+        "ggainterval": ggainterval,
+        "ggamode": GGAMODE_FIXED,
+        "reflat": reflat,
+        "reflon": reflon,
+        "refalt": refalt,
+    }
+
+
+def format_gnssntripclient_command(params: dict) -> str:
+    return "\n".join(
+        [
+            f"export SWEPOS_USER={params['username']}",
+            "export SWEPOS_PASS='***'",
+            "",
+            "gnssntripclient \\",
+            f"  --server {params['server']} \\",
+            f"  --port {params['port']} \\",
+            f"  --mountpoint {params['mountpoint']} \\",
+            f"  --datatype {params['datatype']} \\",
+            f"  --ntripversion {params['ntripversion']} \\",
+            '  --ntripuser "$SWEPOS_USER" \\',
+            '  --ntrippassword "$SWEPOS_PASS" \\',
+            f"  --ggainterval {params['ggainterval']} \\",
+            f"  --reflat {params['reflat']} \\",
+            f"  --reflon {params['reflon']} \\",
+            f"  --refalt {params['refalt']} \\",
+            "  --verbosity 2",
+        ]
+    )
+
+
+def print_params(params: dict) -> None:
+    print("SWEPOS connection parameters:")
+    for key, value in params.items():
+        if key == "password":
+            print(f"  {key}: ***")
+        else:
+            print(f"  {key}: {value}")
+
+    print("\ngnssntripclient command:\n")
+    print(format_gnssntripclient_command(params))
+    sys.stdout.flush()
+
+
+def format_rtcm(raw: bytes, parsed: object) -> str:
+    if hasattr(parsed, "identity"):
+        return f"RTCM {parsed.identity}  {len(raw)} bytes  {parsed}"
+    if isinstance(parsed, str):
+        return parsed
+    return f"RTCM {len(raw)} bytes"
+
+
+def run_ntrip_client(
+    params: dict,
+    *,
+    verbosity: int,
+    output: Queue,
+    stop: threading.Event,
+    retries: int | None = None,
+    timeout: int | None = None,
+) -> None:
+    kwargs: dict = {
+        "server": params["server"],
+        "port": params["port"],
+        "https": params["https"],
+        "mountpoint": params["mountpoint"],
+        "datatype": params["datatype"],
+        "version": params["ntripversion"],
+        "ntripuser": params["username"],
+        "ntrippassword": params["password"],
+        "ggainterval": params["ggainterval"],
+        "ggamode": params["ggamode"],
+        "reflat": params["reflat"],
+        "reflon": params["reflon"],
+        "refalt": params["refalt"],
+        "verbosity": verbosity,
+        "output": output,
+        "stopevent": stop,
+    }
+    if retries is not None:
+        kwargs["retries"] = retries
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+
+    client = GNSSNTRIPClient()
+    client.run(**kwargs)
+
+
+def fetch_mountpoints(server: str, ports: list[int]) -> list[str]:
+    request = (
+        "GET / HTTP/1.1\r\n"
+        f"Host: {server}\r\n"
+        "Ntrip-Version: Ntrip/2.0\r\n"
+        "User-Agent: check_swepos\r\n"
+        "\r\n"
+    )
+
+    for port in ports:
+        try:
+            with socket.create_connection((server, port), timeout=10) as sock:
+                sock.sendall(request.encode())
+                chunks = []
+                while True:
+                    chunk = sock.recv(8192)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    if len(b"".join(chunks)) > 65536:
+                        break
+            body = b"".join(chunks).decode("utf-8", errors="replace")
+        except OSError:
+            continue
+
+        mountpoints: list[str] = []
+        for line in body.split("\r\n"):
+            if not line.startswith("STR;"):
+                continue
+            parts = line.split(";")
+            if len(parts) > 1 and parts[1]:
+                mountpoints.append(parts[1])
+
+        if mountpoints:
+            return mountpoints
+
+    return list(FALLBACK_MOUNTPOINTS)
+
+
+def probe_connection(params: dict, *, timeout: float, verbosity: int) -> tuple[bool, str]:
+    stop = threading.Event()
+    output: Queue = Queue()
+    errors: list[str] = []
+
+    def run_client() -> None:
+        try:
+            run_ntrip_client(
+                params,
+                verbosity=verbosity,
+                output=output,
+                stop=stop,
+                retries=0,
+                timeout=max(3, int(timeout)),
+            )
+        except Exception as exc:  # noqa: BLE001 - surface connection errors to user
+            errors.append(str(exc))
+
+    thread = threading.Thread(target=run_client, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        if errors:
+            return False, errors[0]
+
+        try:
+            raw, parsed = output.get(timeout=0.5)
+        except Empty:
+            if not thread.is_alive():
+                break
+            continue
+
+        if hasattr(parsed, "identity"):
+            stop.set()
+            thread.join(timeout=1.0)
+            return True, f"RTCM {parsed.identity} ({len(raw)} bytes)"
+
+    stop.set()
+    thread.join(timeout=1.0)
+    return False, "auth failed or no RTCM stream"
+
+
+def sweep_swepos(
+    cfg: dict,
+    *,
+    ports: list[int],
+    mountpoints: list[str] | None,
+    reflat: float,
+    reflon: float,
+    refalt: float,
+    ggainterval: int,
+    probe_timeout: float,
+    verbosity: int,
+) -> list[tuple[int, str, bool, str]]:
+    server = cfg["caster"]
+    if mountpoints is None:
+        print(f"Fetching sourcetable from {server}...", flush=True)
+        mountpoints = fetch_mountpoints(server, ports)
+        print(f"Found mountpoints: {', '.join(mountpoints)}\n", flush=True)
+
+    print(
+        f"Sweeping {len(ports)} port(s) x {len(mountpoints)} mountpoint(s) "
+        f"for user {cfg['username']} on {server}\n",
+        flush=True,
+    )
+
+    results: list[tuple[int, str, bool, str]] = []
+    for port in ports:
+        for mountpoint in mountpoints:
+            params = build_params(
+                cfg,
+                port=port,
+                mountpoint=mountpoint,
+                reflat=reflat,
+                reflon=reflon,
+                refalt=refalt,
+                ggainterval=ggainterval,
+            )
+            label = f"{server}:{port}/{mountpoint}"
+            print(f"  trying {label} ... ", end="", flush=True)
+            ok, detail = probe_connection(
+                params,
+                timeout=probe_timeout,
+                verbosity=verbosity,
+            )
+            status = "OK" if ok else "FAIL"
+            print(f"{status}  ({detail})", flush=True)
+            results.append((port, mountpoint, ok, detail))
+
+    print("\nSummary:")
+    working = [(port, mp, detail) for port, mp, ok, detail in results if ok]
+    if working:
+        for port, mountpoint, detail in working:
+            print(f"  OK   {server}:{port}/{mountpoint}  ({detail})")
+    else:
+        print("  No working port/mountpoint combinations found.")
+
+    failed = [(port, mp, detail) for port, mp, ok, detail in results if not ok]
+    if failed and working:
+        print("\nFailed combinations:")
+        for port, mountpoint, detail in failed:
+            print(f"  FAIL {server}:{port}/{mountpoint}  ({detail})")
+
+    sys.stdout.flush()
+    return results
+
+
+def stream_swepos(
+    params: dict,
+    *,
+    duration: float | None,
+    verbosity: int,
+) -> bool:
+    stop = threading.Event()
+    output: Queue = Queue()
+    errors: list[str] = []
+
+    def run_client() -> None:
+        try:
+            run_ntrip_client(
+                params,
+                verbosity=verbosity,
+                output=output,
+                stop=stop,
+            )
+        except Exception as exc:  # noqa: BLE001 - surface connection errors to user
+            errors.append(str(exc))
+
+    print("\nConnecting... (Ctrl+C to stop)\n", flush=True)
+
+    thread = threading.Thread(target=run_client, daemon=True)
+    thread.start()
+
+    connected = False
+    deadline = None
+    if duration is not None:
+        deadline = time.monotonic() + duration
+
+    try:
+        while not stop.is_set():
+            if errors:
+                print(f"FAIL: {errors[0]}", file=sys.stderr)
+                return False
+
+            if deadline is not None and time.monotonic() >= deadline:
+                print(f"\nStopped after {duration:.0f}s")
+                break
+
+            try:
+                raw, parsed = output.get(timeout=0.5)
+            except Empty:
+                if not connected and not thread.is_alive():
+                    break
+                continue
+
+            if not connected:
+                connected = True
+                print("OK: connected, streaming RTCM corrections:\n")
+
+            print(format_rtcm(raw, parsed), flush=True)
+
+    except KeyboardInterrupt:
+        print("\nStopping...", flush=True)
+    finally:
+        stop.set()
+        thread.join(timeout=2.0)
+
+    if connected:
+        return True
+
+    print(
+        f"FAIL: authentication or connection failed for user {params['username']} "
+        f"on {params['server']}:{params['port']} mountpoint {params['mountpoint']}",
+        file=sys.stderr,
+    )
+    return False
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--secrets",
+        type=Path,
+        default=default_secrets_path(),
+        help="path to secrets.yaml (default: config/secrets.yaml)",
+    )
+    parser.add_argument("--reflat", type=float, default=59.204371, help="reference latitude")
+    parser.add_argument("--reflon", type=float, default=18.175105, help="reference longitude")
+    parser.add_argument("--refalt", type=float, default=20.6, help="reference altitude (m)")
+    parser.add_argument(
+        "--ggainterval",
+        type=int,
+        default=10,
+        help="GGA sentence transmission interval in seconds",
+    )
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=None,
+        help="optional stop time in seconds (default: run until Ctrl+C)",
+    )
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="try ports 80 and 8500 across all caster mountpoints",
+    )
+    parser.add_argument(
+        "--ports",
+        type=int,
+        nargs="+",
+        default=list(DEFAULT_PORTS),
+        help="ports to try in sweep mode (default: 80 8500)",
+    )
+    parser.add_argument(
+        "--mountpoints",
+        nargs="+",
+        default=None,
+        help="mountpoints to try in sweep mode (default: fetch from sourcetable)",
+    )
+    parser.add_argument(
+        "--probe-timeout",
+        type=float,
+        default=8.0,
+        help="seconds to wait per port/mountpoint during sweep",
+    )
+    parser.add_argument(
+        "--verbosity",
+        type=int,
+        default=1,
+        choices=[-1, 0, 1, 2, 3],
+        help="pygnssutils log verbosity (RTCM lines use stdout)",
+    )
+    args = parser.parse_args()
+
+    sweep_verbosity = -1 if args.sweep and args.verbosity > 0 else args.verbosity
+    logging.basicConfig(level=max(logging.WARNING, 40 - 10 * max(sweep_verbosity, 0)))
+    if args.sweep:
+        for name in ("pygnssutils", "pygnssutils.gnssntripclient", "pyrtcm"):
+            logging.getLogger(name).setLevel(logging.CRITICAL)
+
+    try:
+        cfg = load_ntrip_config(args.secrets)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
+
+    if args.sweep:
+        results = sweep_swepos(
+            cfg,
+            ports=args.ports,
+            mountpoints=args.mountpoints,
+            reflat=args.reflat,
+            reflon=args.reflon,
+            refalt=args.refalt,
+            ggainterval=args.ggainterval,
+            probe_timeout=args.probe_timeout,
+            verbosity=sweep_verbosity,
+        )
+        return 0 if any(ok for _, _, ok, _ in results) else 1
+
+    params = build_params(
+        cfg,
+        reflat=args.reflat,
+        reflon=args.reflon,
+        refalt=args.refalt,
+        ggainterval=args.ggainterval,
+    )
+    print_params(params)
+
+    ok = stream_swepos(
+        params,
+        duration=args.duration,
+        verbosity=args.verbosity,
+    )
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    sys.exit(main())

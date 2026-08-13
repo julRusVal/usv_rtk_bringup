@@ -11,4 +11,15 @@ install(DIRECTORY udev
   DESTINATION share/${PROJECT_NAME}
 )
 
+install(PROGRAMS
+  utilities/check_swepos
+  utilities/check_serial
+  utilities/ntrip_aux_client
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(FILES utilities/ntrip_secrets.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()
