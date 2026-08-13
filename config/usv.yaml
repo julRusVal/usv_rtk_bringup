@@ -8,10 +8,16 @@ vehicle:
 network:
   receiver_ip: "192.168.3.1"
   receiver_port: 28784
-  # Set to "serial" to use serial device below instead of TCP.
-  connection: "tcp"
-  serial_device: "/dev/ttyACM0"
+  # Serial over USB — host symlinks map to Septentrio command ports (mosaic-G5):
+  #   /dev/usv-rtk       ↔  USB1   driver + SBF/NMEA to ROS
+  #   /dev/usv-rtk-aux   ↔  USB2   NMEA out + RTCM in (ntrip_aux_client)
+  connection: "serial"
+  serial_device: "/dev/usv-rtk"
   serial_baudrate: 921600
+  aux_serial_device: "/dev/usv-rtk-aux"
+  aux_serial_baudrate: 115200
+  # Receiver port for aux NMEA/RTCM (sdio/sno commands and rtk.yaml serial_1).
+  aux_receiver_port: "USB2"
 
 extrinsics:
   base_frame: base_link
@@ -21,7 +27,7 @@ extrinsics:
     rpy: [0.0, 0.0, 0.0]
   gnss:
     child_frame: gnss
-    xyz: [0.0, 0.0, 0.0]
+    xyz: [0.0, 1.0, 0.0]
     rpy: [0.0, 0.0, 0.0]
   aux1:
     child_frame: aux1

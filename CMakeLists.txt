@@ -7,4 +7,8 @@ install(DIRECTORY launch config
   DESTINATION share/${PROJECT_NAME}
 )
 
+install(DIRECTORY udev
+  DESTINATION share/${PROJECT_NAME}
+)
+
 ament_package()

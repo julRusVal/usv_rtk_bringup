@@ -1,0 +1,15 @@
+# Septentrio GNSS receiver (USB ID 152a:8231) — stable device names for USV RTK bringup.
+#
+# The receiver exposes two CDC-ACM serial ports:
+#   /dev/usv-rtk      — interface 0, main GNSS data (was ttyACM0)
+#   /dev/usv-rtk-aux  — interface 2, auxiliary port (was ttyACM1)
+#
+# Install:
+#   sudo cp 99-usv-rtk-septentrio.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+
+SUBSYSTEM=="tty", ENV{ID_USB_INTERFACE_NUM}=="00", ATTRS{idVendor}=="152a", ATTRS{idProduct}=="8231", \
+  SYMLINK+="usv-rtk", GROUP="dialout", MODE="0660", TAG+="uaccess"
+
+SUBSYSTEM=="tty", ENV{ID_USB_INTERFACE_NUM}=="02", ATTRS{idVendor}=="152a", ATTRS{idProduct}=="8231", \
+  SYMLINK+="usv-rtk-aux", GROUP="dialout", MODE="0660", TAG+="uaccess"
