@@ -11,9 +11,11 @@ from launch_ros.actions import Node
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vehicle_config import (  # noqa: E402
+    aux_nmea_commands,
     default_vehicle_config_path,
     load_resolved_config,
     static_transform_nodes,
+    write_temp_commands,
 )
 
 
@@ -38,13 +40,15 @@ def launch_setup(context, *args, **kwargs):
     if not rtk_params_file:
         rtk_params_file = os.path.join(pkg_dir, 'config', 'rtk.yaml')
 
-    secrets_file = _launch_arg(context, 'secrets_file')
-    if not secrets_file:
-        secrets_file = os.path.join(pkg_dir, 'config', 'secrets.yaml')
+    enable_aux_nmea = _launch_arg(context, 'enable_aux_nmea')
+    param_overlay = {'device': resolved['device']}
+    if enable_aux_nmea != 'false':
+        aux_port = resolved['network'].get('aux_receiver_port', 'USB2')
+        param_overlay['custom_commands_file'] = write_temp_commands(
+            aux_nmea_commands(aux_port), prefix='rtk_aux_nmea_'
+        )
 
-    params = [rtk_params_file, {'device': resolved['device']}]
-    if os.path.isfile(secrets_file):
-        params.append(secrets_file)
+    params = [rtk_params_file, param_overlay]
 
     driver_node = Node(
         package='septentrio_gnss_driver',
@@ -63,7 +67,6 @@ def launch_setup(context, *args, **kwargs):
 def generate_launch_description():
     pkg_dir = get_package_share_directory('usv_rtk_bringup')
     default_rtk_params = os.path.join(pkg_dir, 'config', 'rtk.yaml')
-    default_secrets = os.path.join(pkg_dir, 'config', 'secrets.yaml')
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -77,9 +80,9 @@ def generate_launch_description():
             description='Path to Septentrio driver parameter YAML',
         ),
         DeclareLaunchArgument(
-            'secrets_file',
-            default_value=default_secrets,
-            description='Optional NTRIP credentials YAML (gitignored)',
+            'enable_aux_nmea',
+            default_value='true',
+            description='Configure GGA/RMC on aux port for ntrip_aux_client',
         ),
         DeclareLaunchArgument(
             'receiver_ip',

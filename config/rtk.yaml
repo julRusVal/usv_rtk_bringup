@@ -1,9 +1,15 @@
-# Septentrio GNSS driver parameters for USV RTK.
-# NTRIP credentials belong in config/secrets.yaml (see secrets.yaml.example).
+# Septentrio driver parameters for USV RTK bringup.
+#
+# RTCM corrections: external ntrip_aux_client writes to /dev/usv-rtk-aux (host),
+# which maps to receiver USB2. The driver does NOT use NTRIP credentials — those
+# live in config/secrets.yaml for ntrip_aux_client only.
+#
+# serial_1.port: USB2 tells the receiver to accept RTCM on the aux USB port.
+# send_gga: off — GGA to the caster is handled by ntrip_aux_client (NMEA on aux).
 
 septentrio_gnss_driver:
   ros__parameters:
-    device: tcp://192.168.3.1:28784
+    device: serial:/dev/usv-rtk
 
     serial:
       baudrate: 921600
@@ -40,7 +46,7 @@ septentrio_gnss_driver:
     use_ros_axis_orientation: true
 
     receiver_type: gnss
-    multi_antenna: true
+    multi_antenna: false
     datum: Default
 
     poi_to_arp:
@@ -62,7 +68,8 @@ septentrio_gnss_driver:
       rest: 500
 
     use_gnss_time: false
-    ntp_server: true
+    # mosaic-G5: sntp command not supported (driver would send "sntp, on" → Invalid command)
+    ntp_server: false
     ptp_server_clock: false
     latency_compensation: true
 
@@ -78,19 +85,19 @@ septentrio_gnss_driver:
         tls: false
         fingerprint: ""
         rtk_standard: "auto"
-        send_gga: "auto"
+        send_gga: "off"
         keep_open: true
       ip_server_1:
         id: ""
         port: 0
         rtk_standard: "auto"
-        send_gga: "auto"
+        send_gga: "off"
         keep_open: true
       serial_1:
-        port: ""
+        port: "USB2"
         baud_rate: 115200
         rtk_standard: "auto"
-        send_gga: "auto"
+        send_gga: "off"
         keep_open: true
 
     publish:
@@ -98,7 +105,7 @@ septentrio_gnss_driver:
       publish_only_valid: false
       navsatfix: true
       gpsfix: true
-      gpgga: false
+      gpgga: true
       gprmc: false
       gpst: false
       measepoch: false
@@ -110,8 +117,8 @@ septentrio_gnss_driver:
       poscovgeodetic: true
       velcovcartesian: false
       velcovgeodetic: true
-      atteuler: true
-      attcoveuler: true
+      atteuler: false
+      attcoveuler: false
       pose: false
       twist: false
       diagnostics: true
