@@ -1,0 +1,33 @@
+# USV RTK bringup configuration.
+# Override at launch time: vehicle_config:=/path/to/custom.yaml
+# Launch args (receiver_ip, receiver_port) take precedence when set.
+
+vehicle:
+  name: usv
+
+network:
+  receiver_ip: "192.168.3.1"
+  receiver_port: 28784
+  # Set to "serial" to use serial device below instead of TCP.
+  connection: "tcp"
+  serial_device: "/dev/ttyACM0"
+  serial_baudrate: 921600
+
+extrinsics:
+  base_frame: base_link
+  imu:
+    child_frame: imu
+    xyz: [0.0, 0.0, 0.0]
+    rpy: [0.0, 0.0, 0.0]
+  gnss:
+    child_frame: gnss
+    xyz: [0.0, 0.0, 0.0]
+    rpy: [0.0, 0.0, 0.0]
+  aux1:
+    child_frame: aux1
+    xyz: [0.0, -1.0, 0.0]
+    rpy: [0.0, 0.0, 0.0]
+  vsm:
+    child_frame: vsm
+    xyz: [0.0, 0.0, 0.0]
+    rpy: [0.0, 0.0, 0.0]
