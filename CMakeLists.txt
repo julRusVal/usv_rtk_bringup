@@ -15,10 +15,12 @@ install(PROGRAMS
   utilities/check_swepos
   utilities/check_serial
   utilities/ntrip_aux_client
+  utilities/dual_antenna_attitude_remap
   DESTINATION lib/${PROJECT_NAME}
 )
 
 install(FILES utilities/ntrip_secrets.py
+  utilities/attitude_remap.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

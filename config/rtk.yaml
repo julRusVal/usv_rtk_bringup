@@ -65,7 +65,7 @@ septentrio_gnss_driver:
 
     polling_period:
       pvt: 100
-      rest: 500
+      rest: 100
 
     use_gnss_time: false
     # mosaic-G5: sntp command not supported (driver would send "sntp, on" → Invalid command)

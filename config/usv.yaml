@@ -27,11 +27,11 @@ extrinsics:
     rpy: [0.0, 0.0, 0.0]
   gnss:
     child_frame: gnss
-    xyz: [0.0, 1.0, 0.0]
+    xyz: [0.0, 1.0, 0.0]   # primary antenna (rtk_heading.launch.py)
     rpy: [0.0, 0.0, 0.0]
   aux1:
     child_frame: aux1
-    xyz: [0.0, -1.0, 0.0]
+    xyz: [0.0, -1.0, 0.0]  # secondary antenna for dual-antenna heading
     rpy: [0.0, 0.0, 0.0]
   vsm:
     child_frame: vsm

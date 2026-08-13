@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Remap Septentrio dual-antenna attitude to body-frame SMARC topics on /septentrio_rtk/*."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Imu
+from std_msgs.msg import Float64
+from tf2_ros import Buffer, TransformListener
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from attitude_remap import (  # noqa: E402
+    ANGULAR_VEL_COV_UNKNOWN,
+    LINEAR_ACCEL_COV_UNKNOWN,
+    ORIENTATION_COV_UNKNOWN,
+    ResolvedMount,
+    baseline_from_extrinsics,
+    quaternion_from_rpy,
+    remap_attitude,
+    remap_orientation_covariance,
+)
+
+try:
+    from septentrio_gnss_driver.msg import AttCovEuler, AttEuler
+except ImportError:
+    print(
+        'septentrio_gnss_driver is required (build sonar_ws with septentrio_gnss_driver).',
+        file=sys.stderr,
+    )
+    raise
+
+from ament_index_python.packages import get_package_share_directory
+
+_pkg_share = get_package_share_directory('usv_rtk_bringup')
+sys.path.insert(0, str(Path(_pkg_share) / 'launch'))
+from vehicle_config import load_vehicle_config, resolve_extrinsics  # noqa: E402
+
+
+class DualAntennaAttitudeRemapNode(Node):
+    def __init__(self) -> None:
+        super().__init__('dual_antenna_attitude_remap')
+
+        self.declare_parameter('output_prefix', '/septentrio_rtk')
+        self.declare_parameter('input_topic', '/atteuler')
+        self.declare_parameter('cov_input_topic', '/attcoveuler')
+        self.declare_parameter('publish_imu', True)
+        self.declare_parameter('gnss_frame', 'gnss')
+        self.declare_parameter('aux1_frame', 'aux1')
+        self.declare_parameter('body_frame', 'base_link')
+        self.declare_parameter('mount_mode', 'auto')
+        self.declare_parameter('use_ros_axis_orientation', True)
+        self.declare_parameter('vehicle_config', '')
+
+        prefix = self.get_parameter('output_prefix').get_parameter_value().string_value
+        input_topic = self.get_parameter('input_topic').get_parameter_value().string_value
+        cov_input_topic = self.get_parameter('cov_input_topic').get_parameter_value().string_value
+        publish_imu = self.get_parameter('publish_imu').get_parameter_value().bool_value
+        self._body_frame = self.get_parameter('body_frame').get_parameter_value().string_value
+        self._gnss_frame = self.get_parameter('gnss_frame').get_parameter_value().string_value
+        self._aux1_frame = self.get_parameter('aux1_frame').get_parameter_value().string_value
+        self._mount_mode = self.get_parameter('mount_mode').get_parameter_value().string_value
+        self._use_ros_axis = (
+            self.get_parameter('use_ros_axis_orientation').get_parameter_value().bool_value
+        )
+
+        vehicle_config_path = self.get_parameter('vehicle_config').get_parameter_value().string_value
+        if not vehicle_config_path:
+            vehicle_config_path = str(Path(_pkg_share) / 'config' / 'usv.yaml')
+        self._fallback_baseline = baseline_from_extrinsics(
+            resolve_extrinsics(load_vehicle_config(vehicle_config_path))
+        )
+
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
+        self._resolved_mount: ResolvedMount | None = None
+        self._latest_cov: AttCovEuler | None = None
+
+        self._pub_heading = self.create_publisher(Float64, f'{prefix}/heading', 10)
+        self._pub_yaw = self.create_publisher(Float64, f'{prefix}/yaw', 10)
+        self._pub_pitch = self.create_publisher(Float64, f'{prefix}/pitch', 10)
+        self._pub_roll = self.create_publisher(Float64, f'{prefix}/roll', 10)
+        self._pub_imu = (
+            self.create_publisher(Imu, f'{prefix}/imu', 10) if publish_imu else None
+        )
+
+        self.create_subscription(
+            AttEuler,
+            input_topic,
+            self._on_atteuler,
+            qos_profile_sensor_data,
+        )
+        if publish_imu:
+            self.create_subscription(
+                AttCovEuler,
+                cov_input_topic,
+                self._on_attcoveuler,
+                qos_profile_sensor_data,
+            )
+
+        outputs = f'{prefix}/{{heading,yaw,pitch,roll}}'
+        if publish_imu:
+            outputs += f', {prefix}/imu'
+        self.get_logger().info(
+            f'Publishing body-frame attitude on {outputs} from {input_topic}'
+        )
+
+    def _lookup_baseline(self) -> tuple[float, float, float]:
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                self._gnss_frame,
+                self._aux1_frame,
+                rclpy.time.Time(),
+            )
+            t = transform.transform.translation
+            return (t.x, t.y, t.z)
+        except Exception:
+            return self._fallback_baseline
+
+    def _log_mount_change(self, mount: ResolvedMount, baseline: tuple[float, float, float]) -> None:
+        if self._resolved_mount == mount:
+            return
+        self._resolved_mount = mount
+        self.get_logger().info(
+            f'Antenna mount: {mount.value} (gnss->{self._aux1_frame} baseline '
+            f'[{baseline[0]:.3f}, {baseline[1]:.3f}, {baseline[2]:.3f}] m)'
+        )
+
+    def _on_attcoveuler(self, msg: AttCovEuler) -> None:
+        self._latest_cov = msg
+
+    def _on_atteuler(self, msg: AttEuler) -> None:
+        baseline = self._lookup_baseline()
+        body = remap_attitude(
+            msg,
+            baseline,
+            self._mount_mode,
+            use_ros_axis_orientation=self._use_ros_axis,
+        )
+        if body is None:
+            return
+
+        self._log_mount_change(body.mount, baseline)
+
+        self._pub_heading.publish(Float64(data=body.compass_deg))
+        self._pub_yaw.publish(Float64(data=body.yaw_rad))
+        self._pub_pitch.publish(Float64(data=body.pitch_rad))
+        self._pub_roll.publish(Float64(data=body.roll_rad))
+
+        if self._pub_imu is None:
+            return
+
+        qx, qy, qz, qw = quaternion_from_rpy(body.roll_rad, body.pitch_rad, body.yaw_rad)
+        imu = Imu()
+        imu.header.stamp = msg.header.stamp
+        imu.header.frame_id = self._body_frame
+        imu.orientation.x = qx
+        imu.orientation.y = qy
+        imu.orientation.z = qz
+        imu.orientation.w = qw
+
+        cov = None
+        if self._latest_cov is not None:
+            cov = remap_orientation_covariance(self._latest_cov, body.mount, baseline)
+        imu.orientation_covariance = (
+            list(cov) if cov is not None else list(ORIENTATION_COV_UNKNOWN)
+        )
+        imu.angular_velocity_covariance = list(ANGULAR_VEL_COV_UNKNOWN)
+        imu.linear_acceleration_covariance = list(LINEAR_ACCEL_COV_UNKNOWN)
+        self._pub_imu.publish(imu)
+
+
+def main() -> None:
+    rclpy.init()
+    node = DualAntennaAttitudeRemapNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

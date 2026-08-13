@@ -1,0 +1,13 @@
+# Dual-antenna RTK heading overlay — loaded after config/rtk.yaml.
+#
+# Requires a second antenna on AUX1 and extrinsics.gnss / extrinsics.aux1 in
+# usv.yaml. get_spatial_config_from_tf pulls lever arms from static TFs.
+
+septentrio_gnss_driver:
+  ros__parameters:
+    multi_antenna: true
+    get_spatial_config_from_tf: true
+    publish:
+      atteuler: true
+      attcoveuler: true
+      basevectorgeod: true
