@@ -1,0 +1,29 @@
+# GNSS / RTK stack selector — edit primary.module to switch hardware.
+# Override at launch: module:=sbg enable_ntrip:=true gnss_stack:=/path/to.yaml
+
+# Per-hull geometry + SBG serial (merged into driver at launch).
+# Septentrio still uses config/usv.yaml via its launch files — TODO: unify vehicle YAML.
+vehicle_config: config/vehicles/floatsam0.yaml
+
+primary:
+  module: sbg   # septentrio | sbg | ublox
+  septentrio:
+    profile: rtk       # gnss | rtk | rtk_heading
+  sbg:
+    params_file: config/sbg_floatsam0.yaml   # vehicle config (confWithRos: true)
+    # params_file: config/sbg_ellipse_d.yaml  # default: use SBG Center flash only
+  ublox:
+    params_file: config/ublox.yaml
+
+ntrip:
+  auto_launch: false
+  publish_rtcm: true
+  gga_source: auto     # auto | aux_serial | ros_topic
+  gga_topic: ""        # ros_topic GGA source (default /{ROBOT_NAME}/nmea)
+  rtcm_topic: ""       # default /{ROBOT_NAME}/rtcm
+  secrets: config/secrets.yaml
+  release_port: true
+  gga_interval: 10
+  gga_max_age: 5.0
+  lost_fix_grace: 15.0
+  rtcm_frame_id: gnss
