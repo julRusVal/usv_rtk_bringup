@@ -14,11 +14,17 @@
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>septentrio_gnss_driver</exec_depend>
+  <exec_depend>ublox_dgnss</exec_depend>
+  <exec_depend>ublox_dgnss_node</exec_depend>
+  <exec_depend>ublox_nav_sat_fix_hp_node</exec_depend>
+  <exec_depend>sbg_driver</exec_depend>
   <exec_depend>rclcpp_components</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>gps_msgs</exec_depend>
+  <exec_depend>nmea_msgs</exec_depend>
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>rtcm_msgs</exec_depend>
 
