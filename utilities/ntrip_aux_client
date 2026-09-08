@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NTRIP client on the aux serial port — GGA-gated, pygnssutils-backed."""
+"""NTRIP client — GGA from aux serial or ROS NMEA; RTCM to serial and/or ROS."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from queue import Empty, Queue
 
@@ -115,8 +116,11 @@ def print_startup_config(
     ntrip_cfg: dict,
     secrets_path: Path,
     vehicle_config: Path,
-    device: Path,
-    baud: int,
+    device: Path | None,
+    baud: int | None,
+    gga_source: str,
+    gga_topic: str,
+    ros_only: bool,
     gga_interval: int,
     gga_max_age: float,
     lost_fix_grace: float,
@@ -135,13 +139,18 @@ def print_startup_config(
     print(f"  NTRIP version:    {version}")
     print(f"  username:         {ntrip_cfg['username']}")
     print("  password:         ***")
-    print(f"  aux serial:       {device} @ {baud}")
+    print(f"  aux serial:       {device or '(none)'} @ {baud or '-'}")
+    print(f"  GGA source:       {gga_source}")
+    if gga_source == "ros_topic":
+        print(f"  GGA topic:        {gga_topic}")
+    print(f"  ros-only:         {ros_only}")
     print(f"  GGA interval:     {gga_interval}s")
     print(f"  GGA max age:      {gga_max_age}s")
     print(f"  lost-fix grace:   {lost_fix_grace}s")
     print(f"  min fix quality:  {MIN_FIX_QUALITY}")
     print(f"  release port:     {release_port}")
-    print(f"  publish RTCM:     {publish_rtcm}")
+    print(f"  RTCM → serial:    {device if not ros_only else '(disabled)'}")
+    print(f"  RTCM → ROS topic: {publish_rtcm}")
     if publish_rtcm:
         print(f"  RTCM topic:       {rtcm_topic}")
         print(f"  RTCM frame_id:    {rtcm_frame_id}")
@@ -184,6 +193,25 @@ class GgaFix:
         }
 
 
+def gga_fix_from_parsed(parsed, raw: bytes) -> GgaFix | None:
+    if parsed is None or getattr(parsed, "msgID", "") != "GGA":
+        return None
+    quality = int(getattr(parsed, "quality", 0))
+    return GgaFix(
+        lat=float(parsed.lat),
+        lon=float(parsed.lon),
+        alt=float(getattr(parsed, "alt", 0.0) or 0.0),
+        sep=float(getattr(parsed, "sep", 0.0) or 0.0),
+        quality=quality,
+        num_sv=int(getattr(parsed, "numSV", 0) or 0),
+        hdop=float(getattr(parsed, "HDOP", 0.0) or 0.0),
+        age=float(getattr(parsed, "diffAge", 0.0) or 0.0),
+        station=int(getattr(parsed, "diffStation", 0) or 0),
+        raw=raw if isinstance(raw, (bytes, bytearray)) else bytes(raw),
+        updated_at=time.monotonic(),
+    )
+
+
 class GgaMonitor:
     """Read NMEA from aux serial and track the latest GGA fix."""
 
@@ -197,8 +225,9 @@ class GgaMonitor:
     def start(self) -> None:
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 2.0) -> None:
         self._stop.set()
+        self._thread.join(timeout=timeout)
 
     def latest(self, max_age: float) -> GgaFix | None:
         with self._lock:
@@ -217,28 +246,106 @@ class GgaMonitor:
                 break
             if parsed is None or getattr(parsed, "msgID", "") != "GGA":
                 continue
-            quality = int(getattr(parsed, "quality", 0))
-            fix = GgaFix(
-                lat=float(parsed.lat),
-                lon=float(parsed.lon),
-                alt=float(getattr(parsed, "alt", 0.0) or 0.0),
-                sep=float(getattr(parsed, "sep", 0.0) or 0.0),
-                quality=quality,
-                num_sv=int(getattr(parsed, "numSV", 0) or 0),
-                hdop=float(getattr(parsed, "HDOP", 0.0) or 0.0),
-                age=float(getattr(parsed, "diffAge", 0.0) or 0.0),
-                station=int(getattr(parsed, "diffStation", 0) or 0),
-                raw=_raw if isinstance(_raw, (bytes, bytearray)) else bytes(_raw),
-                updated_at=time.monotonic(),
+            fix = gga_fix_from_parsed(
+                parsed,
+                _raw if isinstance(_raw, (bytes, bytearray)) else bytes(_raw),
             )
+            if fix is None:
+                continue
             with self._lock:
                 self._latest = fix
 
 
-class NtripAuxApp:
-    """Calling app for GNSSNTRIPClient — supplies live GGA from GgaMonitor."""
+class RosGgaMonitor:
+    """Subscribe to nmea_msgs/Sentence and track the latest GGA fix."""
 
-    def __init__(self, monitor: GgaMonitor, max_gga_age: float):
+    def __init__(self, topic: str):
+        try:
+            import rclpy
+            from nmea_msgs.msg import Sentence
+            from rclpy.executors import SingleThreadedExecutor
+        except ImportError as exc:
+            raise RuntimeError(
+                "ROS GGA source requires rclpy and nmea_msgs"
+            ) from exc
+
+        self._Sentence = Sentence
+        self._lock = threading.Lock()
+        self._latest: GgaFix | None = None
+        self._stop = threading.Event()
+        if not rclpy.ok():
+            rclpy.init()
+        self._node = rclpy.create_node("ntrip_aux_client_gga")
+        self._sub = self._node.create_subscription(
+            Sentence,
+            topic,
+            self._on_sentence,
+            10,
+        )
+        self._executor = SingleThreadedExecutor()
+        self._executor.add_node(self._node)
+        self._thread = threading.Thread(target=self._spin, name="gga-ros-spin", daemon=True)
+
+    def _spin(self) -> None:
+        try:
+            self._executor.spin()
+        except Exception:
+            if not self._stop.is_set():
+                raise
+
+    def _on_sentence(self, msg) -> None:
+        sentence = (msg.sentence or "").strip()
+        if not sentence or "GGA" not in sentence:
+            return
+        line = sentence if sentence.endswith("\r\n") else f"{sentence}\r\n"
+        raw = line.encode("ascii", errors="ignore")
+        try:
+            reader = NMEAReader(BytesIO(raw), quitonerror=1)
+            _raw, parsed = reader.read()
+        except Exception:
+            return
+        fix = gga_fix_from_parsed(parsed, raw)
+        if fix is None:
+            return
+        with self._lock:
+            self._latest = fix
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        import rclpy
+
+        self._stop.set()
+        self._executor.shutdown()
+        self._thread.join(timeout=timeout)
+        if self._node.context.ok():
+            self._node.destroy_node()
+
+    def latest(self, max_age: float) -> GgaFix | None:
+        with self._lock:
+            if self._latest is None:
+                return None
+            if time.monotonic() - self._latest.updated_at > max_age:
+                return None
+            return self._latest
+
+
+class GgaMonitorBase:
+    def start(self) -> None:
+        raise NotImplementedError
+
+    def stop(self, timeout: float = 2.0) -> None:
+        raise NotImplementedError
+
+    def latest(self, max_age: float) -> GgaFix | None:
+        raise NotImplementedError
+
+
+class NtripAuxApp:
+    """Calling app for GNSSNTRIPClient — supplies live GGA."""
+
+    def __init__(self, monitor: GgaMonitorBase, max_gga_age: float):
         self._monitor = monitor
         self._max_gga_age = max_gga_age
 
@@ -271,11 +378,23 @@ class RtcmRosPublisher:
         self._frame_id = frame_id
         self._executor = SingleThreadedExecutor()
         self._executor.add_node(self._node)
-        self._thread = threading.Thread(target=self._executor.spin, daemon=True)
+        self._shutdown = threading.Event()
+        self._thread = threading.Thread(target=self._spin, name="ros-spin", daemon=True)
         self._thread.start()
         self._count = 0
 
+    def _spin(self) -> None:
+        try:
+            self._executor.spin()
+        except Exception:
+            if not self._shutdown.is_set():
+                raise
+
     def publish(self, raw: bytes, parsed: object = None) -> None:
+        import rclpy
+
+        if self._shutdown.is_set() or not rclpy.ok():
+            return
         msg = self._Message()
         msg.header.stamp = self._node.get_clock().now().to_msg()
         msg.header.frame_id = self._frame_id
@@ -292,11 +411,16 @@ class RtcmRosPublisher:
                 self._pub.topic_name,
             )
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float = 2.0) -> None:
         import rclpy
 
+        if self._shutdown.is_set():
+            return
+        self._shutdown.set()
         self._executor.shutdown()
-        self._node.destroy_node()
+        self._thread.join(timeout=timeout)
+        if self._node.context.ok():
+            self._node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 
@@ -321,8 +445,9 @@ class RtcmRelay:
     def start(self) -> None:
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 2.0) -> None:
         self._stop.set()
+        self._thread.join(timeout=timeout)
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -330,11 +455,50 @@ class RtcmRelay:
                 raw, parsed = self._queue.get(timeout=0.5)
             except Empty:
                 continue
+            if self._stop.is_set():
+                break
             if not isinstance(raw, (bytes, bytearray)):
                 continue
-            self._ser.write(raw)
+            try:
+                self._ser.write(raw)
+            except (serial.SerialException, OSError):
+                break
             if self._ros is not None:
                 self._ros.publish(bytes(raw), parsed)
+
+
+class RtcmQueuePublisher:
+    """Drain RTCM queue and publish to ROS (no serial)."""
+
+    def __init__(
+        self,
+        output_queue: Queue,
+        ros_publisher: RtcmRosPublisher,
+        stop_event: threading.Event,
+    ):
+        self._queue = output_queue
+        self._ros = ros_publisher
+        self._stop = stop_event
+        self._thread = threading.Thread(target=self._run, name="rtcm-ros-only", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop.set()
+        self._thread.join(timeout=timeout)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                raw, parsed = self._queue.get(timeout=0.5)
+            except Empty:
+                continue
+            if self._stop.is_set():
+                break
+            if not isinstance(raw, (bytes, bytearray)):
+                continue
+            self._ros.publish(bytes(raw), parsed)
 
 
 class NtripAuxBridge:
@@ -342,8 +506,12 @@ class NtripAuxBridge:
         self,
         *,
         ntrip_cfg: dict,
-        device: Path,
-        baud: int,
+        device: Path | None,
+        baud: int | None,
+        gga_source: str,
+        gga_topic: str,
+        ros_only: bool,
+        rtcm_serial_relay: bool,
         gga_interval: int,
         gga_max_age: float,
         lost_fix_grace: float,
@@ -356,6 +524,10 @@ class NtripAuxBridge:
         self._ntrip_cfg = ntrip_cfg
         self._device = device
         self._baud = baud
+        self._gga_source = gga_source
+        self._gga_topic = gga_topic
+        self._ros_only = ros_only
+        self._rtcm_serial_relay = rtcm_serial_relay
         self._gga_interval = gga_interval
         self._gga_max_age = gga_max_age
         self._lost_fix_grace = lost_fix_grace
@@ -370,6 +542,7 @@ class NtripAuxBridge:
         self._last_valid_gga: float | None = None
         self._rtcm_queue: Queue | None = None
         self._rtcm_relay: RtcmRelay | None = None
+        self._rtcm_ros_only: RtcmQueuePublisher | None = None
         self._ros_publisher: RtcmRosPublisher | None = None
 
     def stop(self) -> None:
@@ -385,13 +558,15 @@ class NtripAuxBridge:
         self._client = None
         self._connected_since = None
 
-    def _connect(self, app: NtripAuxApp, ser: serial.Serial) -> None:
+    def _connect(self, app: NtripAuxApp, ser: serial.Serial | None) -> None:
         cfg = self._ntrip_cfg
         output: serial.Serial | Queue
-        if self._publish_rtcm:
+        if self._publish_rtcm or self._ros_only:
             assert self._rtcm_queue is not None
             output = self._rtcm_queue
         else:
+            if ser is None:
+                raise RuntimeError("serial output required when not publishing RTCM to ROS")
             output = ser
 
         self._client = GNSSNTRIPClient(app, verbosity=self._verbosity)
@@ -418,17 +593,30 @@ class NtripAuxBridge:
         )
 
     def run(self) -> int:
-        if self._release_port:
-            released = release_serial_port(self._device)
-            if released:
-                logging.info(
-                    "Cleared %d holder(s) on %s: %s",
-                    len(released),
-                    self._device,
-                    ", ".join(str(pid) for pid in released),
-                )
+        if self._ros_only and not self._publish_rtcm:
+            logging.error("--ros-only requires --publish-rtcm")
+            return 1
 
-        if self._publish_rtcm:
+        if self._gga_source == "ros_topic" and not self._gga_topic:
+            logging.error("--gga-topic is required when --gga-source=ros_topic")
+            return 1
+
+        ser: serial.Serial | None = None
+        monitor: GgaMonitorBase
+
+        if not self._ros_only:
+            assert self._device is not None and self._baud is not None
+            if self._release_port:
+                released = release_serial_port(self._device)
+                if released:
+                    logging.info(
+                        "Cleared %d holder(s) on %s: %s",
+                        len(released),
+                        self._device,
+                        ", ".join(str(pid) for pid in released),
+                    )
+
+        if self._publish_rtcm or self._ros_only:
             try:
                 self._ros_publisher = RtcmRosPublisher(
                     self._rtcm_topic,
@@ -440,34 +628,64 @@ class NtripAuxBridge:
             self._rtcm_queue = Queue()
             logging.info("ROS2 RTCM publishing enabled on %s", self._rtcm_topic)
 
-        try:
-            ser = serial.Serial(str(self._device), self._baud, timeout=1)
-        except serial.SerialException as exc:
-            holders = port_holder_pids(self._device)
-            hint = ""
-            if holders:
-                hint = f" (held by PIDs: {', '.join(str(p) for p in holders)})"
-            logging.error("Cannot open %s: %s%s", self._device, exc, hint)
-            return 1
-
-        if self._publish_rtcm and self._rtcm_queue is not None:
-            self._rtcm_relay = RtcmRelay(
-                ser,
-                self._rtcm_queue,
-                ros_publisher=self._ros_publisher,
-                stop_event=self._stop,
+        if self._gga_source == "ros_topic":
+            try:
+                monitor = RosGgaMonitor(self._gga_topic)
+            except RuntimeError as exc:
+                logging.error("%s", exc)
+                return 1
+            monitor.start()
+            logging.info(
+                "Listening for GGA on %s — NTRIP starts when fix quality >= %d",
+                self._gga_topic,
+                MIN_FIX_QUALITY,
             )
-            self._rtcm_relay.start()
+        else:
+            assert self._device is not None and self._baud is not None
+            try:
+                ser = serial.Serial(str(self._device), self._baud, timeout=1)
+            except serial.SerialException as exc:
+                holders = port_holder_pids(self._device)
+                hint = ""
+                if holders:
+                    hint = f" (held by PIDs: {', '.join(str(p) for p in holders)})"
+                logging.error("Cannot open %s: %s%s", self._device, exc, hint)
+                return 1
+            monitor = GgaMonitor(ser)
+            monitor.start()
+            logging.info(
+                "Listening for GGA on %s @ %d — NTRIP starts when fix quality >= %d",
+                self._device,
+                self._baud,
+                MIN_FIX_QUALITY,
+            )
 
-        monitor = GgaMonitor(ser)
+        if self._ros_only:
+            assert self._rtcm_queue is not None and self._ros_publisher is not None
+            self._rtcm_ros_only = RtcmQueuePublisher(
+                self._rtcm_queue,
+                self._ros_publisher,
+                self._stop,
+            )
+            self._rtcm_ros_only.start()
+        elif self._publish_rtcm and self._rtcm_queue is not None:
+            if self._rtcm_serial_relay and ser is not None:
+                self._rtcm_relay = RtcmRelay(
+                    ser,
+                    self._rtcm_queue,
+                    ros_publisher=self._ros_publisher,
+                    stop_event=self._stop,
+                )
+                self._rtcm_relay.start()
+            elif self._ros_publisher is not None:
+                self._rtcm_ros_only = RtcmQueuePublisher(
+                    self._rtcm_queue,
+                    self._ros_publisher,
+                    self._stop,
+                )
+                self._rtcm_ros_only.start()
+
         app = NtripAuxApp(monitor, self._gga_max_age)
-        monitor.start()
-        logging.info(
-            "Listening for GGA on %s @ %d — NTRIP starts when fix quality >= %d",
-            self._device,
-            self._baud,
-            MIN_FIX_QUALITY,
-        )
 
         try:
             while not self._stop.is_set():
@@ -488,10 +706,13 @@ class NtripAuxBridge:
             logging.info("Interrupted")
         finally:
             self._disconnect("shutdown")
-            monitor.stop()
             if self._rtcm_relay is not None:
                 self._rtcm_relay.stop()
-            ser.close()
+            if self._rtcm_ros_only is not None:
+                self._rtcm_ros_only.stop()
+            monitor.stop()
+            if ser is not None:
+                ser.close()
             if self._ros_publisher is not None:
                 self._ros_publisher.shutdown()
 
@@ -566,6 +787,27 @@ def main() -> int:
         help="frame_id in RTCM message header",
     )
     parser.add_argument(
+        "--gga-source",
+        choices=["aux_serial", "ros_topic"],
+        default="aux_serial",
+        help="GGA fix source: aux serial NMEA or ROS nmea_msgs/Sentence topic",
+    )
+    parser.add_argument(
+        "--gga-topic",
+        default="",
+        help="ROS topic for GGA when --gga-source=ros_topic",
+    )
+    parser.add_argument(
+        "--ros-only",
+        action="store_true",
+        help="do not open aux serial; publish RTCM to ROS only (requires --publish-rtcm)",
+    )
+    parser.add_argument(
+        "--no-serial-rtcm",
+        action="store_true",
+        help="do not write RTCM to aux serial (GGA may still use aux serial)",
+    )
+    parser.add_argument(
         "--verbosity",
         type=int,
         default=1,
@@ -587,8 +829,12 @@ def main() -> int:
         logging.error("%s", exc)
         return 1
 
-    device = args.device or Path(default_device)
-    baud = args.baud if args.baud is not None else default_baud
+    device = args.device or (Path(default_device) if not args.ros_only else None)
+    baud = args.baud if args.baud is not None else (default_baud if not args.ros_only else None)
+
+    if args.gga_source == "ros_topic" and not args.gga_topic:
+        logging.error("--gga-topic is required when --gga-source=ros_topic")
+        return 1
 
     print_startup_config(
         ntrip_cfg=ntrip_cfg,
@@ -596,6 +842,9 @@ def main() -> int:
         vehicle_config=args.vehicle_config,
         device=device,
         baud=baud,
+        gga_source=args.gga_source,
+        gga_topic=args.gga_topic,
+        ros_only=args.ros_only,
         gga_interval=args.gga_interval,
         gga_max_age=args.gga_max_age,
         lost_fix_grace=args.lost_fix_grace,
@@ -610,6 +859,10 @@ def main() -> int:
         ntrip_cfg=ntrip_cfg,
         device=device,
         baud=baud,
+        gga_source=args.gga_source,
+        gga_topic=args.gga_topic,
+        ros_only=args.ros_only,
+        rtcm_serial_relay=not args.no_serial_rtcm,
         gga_interval=args.gga_interval,
         gga_max_age=args.gga_max_age,
         lost_fix_grace=args.lost_fix_grace,

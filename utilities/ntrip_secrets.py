@@ -1,4 +1,4 @@
-"""Load NTRIP credentials from config/secrets.yaml (ntrip_aux_client / check_swepos)."""
+"""Load NTRIP credentials from config/secrets.yaml (NTRIP clients / check_swepos)."""
 
 from __future__ import annotations
 

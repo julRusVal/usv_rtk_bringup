@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""NTRIP client for ROS 2 — subscribe NMEA (GGA), publish RTCM.
+
+Connects to the caster only when a valid GGA fix is available on the NMEA topic.
+Disconnects when the fix is lost or stale.
+
+Typical use (SBG / u-blox with ROS corrections path):
+
+  ros2 run usv_rtk_bringup ntrip_ros_client \\
+    --nmea-topic /nmea --rtcm-topic /floatsam0/rtcm
+
+Requires: pygnssutils (pynmeagps), rclpy, nmea_msgs, rtcm_msgs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import signal
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from io import BytesIO
+from pathlib import Path
+from queue import Empty, Queue
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ntrip_secrets import default_secrets_path, load_ntrip_config  # noqa: E402
+
+try:
+    import rclpy
+    from nmea_msgs.msg import Sentence
+    from pynmeagps import NMEAReader
+    from pygnssutils.globals import FIXTYPE_GGA
+    from pygnssutils.gnssntripclient import GNSSNTRIPClient
+    from rclpy.node import Node
+    from rtcm_msgs.msg import Message
+except ImportError:
+    print(
+        "Dependencies: rclpy, nmea_msgs, rtcm_msgs, pygnssutils (pynmeagps).\n"
+        "  python3 -m pip install pygnssutils",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+GGALIVE = 0
+DEFAULT_MIN_FIX_QUALITY = 1
+
+
+def ntrip_version(version: str) -> str:
+    version = version.strip().lower()
+    if version in {"v2", "2", "2.0"}:
+        return "2.0"
+    if version in {"v1", "1", "1.0"}:
+        return "1.0"
+    return version
+
+
+@dataclass
+class GgaFix:
+    lat: float
+    lon: float
+    alt: float
+    sep: float
+    quality: int
+    num_sv: int
+    hdop: float
+    age: float
+    station: int
+    updated_at: float
+
+    def valid(self, min_quality: int) -> bool:
+        return self.quality >= min_quality
+
+    def fix_string(self) -> str:
+        return FIXTYPE_GGA.get(self.quality, "3D")
+
+    def as_coordinates(self) -> dict:
+        return {
+            "lat": self.lat,
+            "lon": self.lon,
+            "alt": self.alt,
+            "sep": self.sep,
+            "fix": self.fix_string(),
+            "sip": self.num_sv,
+            "hdop": self.hdop,
+            "diffage": self.age,
+            "diffstation": self.station,
+        }
+
+
+def gga_fix_from_parsed(parsed) -> GgaFix | None:
+    if parsed is None or getattr(parsed, "msgID", "") != "GGA":
+        return None
+    return GgaFix(
+        lat=float(parsed.lat),
+        lon=float(parsed.lon),
+        alt=float(getattr(parsed, "alt", 0.0) or 0.0),
+        sep=float(getattr(parsed, "sep", 0.0) or 0.0),
+        quality=int(getattr(parsed, "quality", 0)),
+        num_sv=int(getattr(parsed, "numSV", 0) or 0),
+        hdop=float(getattr(parsed, "HDOP", 0.0) or 0.0),
+        age=float(getattr(parsed, "diffAge", 0.0) or 0.0),
+        station=int(getattr(parsed, "diffStation", 0) or 0),
+        updated_at=time.monotonic(),
+    )
+
+
+def parse_gga_sentence(sentence: str) -> GgaFix | None:
+    text = (sentence or "").strip()
+    if not text or "GGA" not in text:
+        return None
+    line = text if text.endswith("\r\n") else f"{text}\r\n"
+    raw = line.encode("ascii", errors="ignore")
+    try:
+        reader = NMEAReader(BytesIO(raw), quitonerror=1)
+        _raw, parsed = reader.read()
+    except Exception:
+        return None
+    return gga_fix_from_parsed(parsed)
+
+
+class NtripGgaApp:
+    """Calling app for GNSSNTRIPClient — supplies live GGA from the ROS node."""
+
+    def __init__(self, node: "NtripRosClient"):
+        self._node = node
+
+    def get_coordinates(self) -> dict:
+        fix = self._node.latest_gga()
+        if fix is None or not fix.valid(self._node.min_fix_quality):
+            raise ValueError("no valid GGA")
+        return fix.as_coordinates()
+
+
+class NtripRosClient(Node):
+    """Subscribe NMEA GGA, gate NTRIP on valid fix, publish RTCM."""
+
+    def __init__(
+        self,
+        *,
+        ntrip_cfg: dict,
+        nmea_topic: str,
+        rtcm_topic: str,
+        rtcm_frame_id: str,
+        gga_interval: int,
+        gga_max_age: float,
+        lost_fix_grace: float,
+        min_fix_quality: int,
+        verbosity: int,
+    ):
+        super().__init__("ntrip_ros_client")
+        self._ntrip_cfg = ntrip_cfg
+        self._gga_interval = gga_interval
+        self._gga_max_age = gga_max_age
+        self._lost_fix_grace = lost_fix_grace
+        self.min_fix_quality = min_fix_quality
+        self._rtcm_frame_id = rtcm_frame_id
+        self._verbosity = verbosity
+
+        self._lock = threading.Lock()
+        self._latest: GgaFix | None = None
+        self._last_valid_gga: float | None = None
+        self._client: GNSSNTRIPClient | None = None
+        self._rtcm_queue: Queue = Queue()
+        self._rtcm_count = 0
+        self._shutdown = threading.Event()
+
+        self._nmea_sub = self.create_subscription(
+            Sentence,
+            nmea_topic,
+            self._on_nmea,
+            10,
+        )
+        self._rtcm_pub = self.create_publisher(Message, rtcm_topic, 10)
+        self._gate_timer = self.create_timer(0.5, self._on_gate_timer)
+        self._rtcm_timer = self.create_timer(0.05, self._on_rtcm_timer)
+
+        self.get_logger().info(
+            f"NMEA GGA on {nmea_topic} (quality >= {min_fix_quality}, "
+            f"max age {gga_max_age:.1f}s); RTCM on {rtcm_topic}"
+        )
+        self.get_logger().info(
+            f"NTRIP {ntrip_cfg['caster']}:{ntrip_cfg['caster_port']}/"
+            f"{ntrip_cfg['mountpoint']} (connects only with valid GGA)"
+        )
+
+    def _on_nmea(self, msg: Sentence) -> None:
+        fix = parse_gga_sentence(msg.sentence)
+        if fix is None:
+            return
+        with self._lock:
+            self._latest = fix
+            if fix.valid(self.min_fix_quality):
+                self._last_valid_gga = fix.updated_at
+
+    def latest_gga(self) -> GgaFix | None:
+        with self._lock:
+            if self._latest is None:
+                return None
+            if time.monotonic() - self._latest.updated_at > self._gga_max_age:
+                return None
+            return self._latest
+
+    def _last_valid_age(self) -> float | None:
+        with self._lock:
+            if self._last_valid_gga is None:
+                return None
+            return time.monotonic() - self._last_valid_gga
+
+    def _disconnect(self, reason: str) -> None:
+        if self._client is None:
+            return
+        self.get_logger().info(f"Stopping NTRIP: {reason}")
+        self._client.stop()
+        self._client = None
+
+    def _connect(self) -> None:
+        app = NtripGgaApp(self)
+        self._client = GNSSNTRIPClient(app, verbosity=self._verbosity)
+        cfg = self._ntrip_cfg
+        self._client.run(
+            server=cfg["caster"],
+            port=cfg["caster_port"],
+            https=0,
+            mountpoint=cfg["mountpoint"],
+            datatype="RTCM",
+            version=ntrip_version(cfg.get("version", "v2")),
+            ntripuser=cfg["username"],
+            ntrippassword=cfg["password"],
+            ggainterval=self._gga_interval,
+            ggamode=GGALIVE,
+            output=self._rtcm_queue,
+            stopevent=self._client.stopevent,
+        )
+        self.get_logger().info(
+            f"NTRIP connected to {cfg['caster']}:{cfg['caster_port']}/{cfg['mountpoint']}"
+        )
+
+    def _on_gate_timer(self) -> None:
+        if self._shutdown.is_set():
+            return
+
+        fix = self.latest_gga()
+        if fix is not None and fix.valid(self.min_fix_quality):
+            if self._client is None:
+                try:
+                    self._connect()
+                except Exception as exc:
+                    self.get_logger().error(f"NTRIP connect failed: {exc}")
+                    self._disconnect("connect failed")
+            return
+
+        if self._client is not None:
+            stale_for = self._last_valid_age()
+            if stale_for is None or stale_for > self._lost_fix_grace:
+                self._disconnect("GGA fix lost or stale")
+
+    def _on_rtcm_timer(self) -> None:
+        if self._shutdown.is_set():
+            return
+        while True:
+            try:
+                raw, parsed = self._rtcm_queue.get_nowait()
+            except Empty:
+                break
+            if not isinstance(raw, (bytes, bytearray)):
+                continue
+            msg = Message()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = self._rtcm_frame_id
+            msg.message = list(bytes(raw))
+            self._rtcm_pub.publish(msg)
+            self._rtcm_count += 1
+            if self._rtcm_count == 1 or self._rtcm_count % 100 == 0:
+                identity = getattr(parsed, "identity", "?")
+                self.get_logger().info(
+                    f"Published RTCM #{self._rtcm_count} ({identity}, {len(raw)} bytes)"
+                )
+
+    def shutdown(self) -> None:
+        self._shutdown.set()
+        self._disconnect("shutdown")
+
+
+def print_startup_config(
+    *,
+    ntrip_cfg: dict,
+    secrets_path: Path,
+    nmea_topic: str,
+    rtcm_topic: str,
+    rtcm_frame_id: str,
+    gga_interval: int,
+    gga_max_age: float,
+    lost_fix_grace: float,
+    min_fix_quality: int,
+    verbosity: int,
+) -> None:
+    print("ntrip_ros_client — configuration")
+    print(f"  secrets:          {secrets_path}")
+    print(f"  NTRIP caster:     {ntrip_cfg['caster']}:{ntrip_cfg['caster_port']}")
+    print(f"  mountpoint:       {ntrip_cfg['mountpoint']}")
+    print(f"  NTRIP version:    {ntrip_version(ntrip_cfg.get('version', 'v2'))}")
+    print(f"  username:         {ntrip_cfg['username']}")
+    print("  password:         ***")
+    print(f"  NMEA topic:       {nmea_topic}")
+    print(f"  RTCM topic:       {rtcm_topic}")
+    print(f"  RTCM frame_id:    {rtcm_frame_id}")
+    print(f"  GGA interval:     {gga_interval}s")
+    print(f"  GGA max age:      {gga_max_age}s")
+    print(f"  lost-fix grace:   {lost_fix_grace}s")
+    print(f"  min fix quality:  {min_fix_quality}")
+    print(f"  log verbosity:    {verbosity}")
+    print()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--secrets",
+        type=Path,
+        default=default_secrets_path(),
+        help="NTRIP credentials YAML",
+    )
+    parser.add_argument(
+        "--nmea-topic",
+        default="/nmea",
+        help="nmea_msgs/Sentence topic (GGA used for caster login)",
+    )
+    parser.add_argument(
+        "--rtcm-topic",
+        default="/rtcm",
+        help="rtcm_msgs/Message topic for corrections",
+    )
+    parser.add_argument(
+        "--rtcm-frame-id",
+        default="gnss",
+        help="frame_id in RTCM message header",
+    )
+    parser.add_argument(
+        "--gga-interval",
+        type=int,
+        default=10,
+        help="seconds between GGA sentences sent to the NTRIP caster",
+    )
+    parser.add_argument(
+        "--gga-max-age",
+        type=float,
+        default=5.0,
+        help="ignore GGA sentences older than this many seconds",
+    )
+    parser.add_argument(
+        "--lost-fix-grace",
+        type=float,
+        default=15.0,
+        help="disconnect NTRIP after this many seconds without valid GGA",
+    )
+    parser.add_argument(
+        "--min-fix-quality",
+        type=int,
+        default=DEFAULT_MIN_FIX_QUALITY,
+        help="minimum GGA fix quality (0=invalid, 1=standalone GPS, 4=RTK fixed, …)",
+    )
+    parser.add_argument(
+        "--verbosity",
+        type=int,
+        default=1,
+        choices=[-1, 0, 1, 2, 3],
+        help="pygnssutils log verbosity",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    try:
+        ntrip_cfg = load_ntrip_config(args.secrets)
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        logging.error("%s", exc)
+        return 1
+
+    print_startup_config(
+        ntrip_cfg=ntrip_cfg,
+        secrets_path=args.secrets,
+        nmea_topic=args.nmea_topic,
+        rtcm_topic=args.rtcm_topic,
+        rtcm_frame_id=args.rtcm_frame_id,
+        gga_interval=args.gga_interval,
+        gga_max_age=args.gga_max_age,
+        lost_fix_grace=args.lost_fix_grace,
+        min_fix_quality=args.min_fix_quality,
+        verbosity=args.verbosity,
+    )
+
+    rclpy.init()
+    node = NtripRosClient(
+        ntrip_cfg=ntrip_cfg,
+        nmea_topic=args.nmea_topic,
+        rtcm_topic=args.rtcm_topic,
+        rtcm_frame_id=args.rtcm_frame_id,
+        gga_interval=args.gga_interval,
+        gga_max_age=args.gga_max_age,
+        lost_fix_grace=args.lost_fix_grace,
+        min_fix_quality=args.min_fix_quality,
+        verbosity=args.verbosity,
+    )
+
+    def _signal_handler(_signum, _frame):
+        node.shutdown()
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.shutdown()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
