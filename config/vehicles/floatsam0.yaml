@@ -1,0 +1,35 @@
+# Per-hull layout and devices for floatsam0 (SBG + shared TF).
+# Robot namespace: ROBOT_NAME=floatsam0 in usv-host-setup/config/usv-robot.env.sh
+#
+# Referenced from config/gnss_stack.yaml → vehicle_config.
+# sbg.launch.py merges extrinsics + sbg serial into the driver param overlay.
+#
+# TODO(septentrio): Septentrio launches still use config/usv.yaml directly — unify later.
+
+vehicle:
+  name: floatsam0
+
+sbg:
+  serial_device: "/dev/usv-sbg"
+  serial_baudrate: 921600   # Ellipse-D PORT_A (verified on floatsam0; was 115200 in old docs)
+
+extrinsics:
+  # ROS FLU offsets in the imu child frame (X fwd, Y port/left, Z up).
+  # sbg.launch.py converts to SBG IMU FRD lever arms (Y right, Z down).
+  base_frame: base_link
+  imu:
+    child_frame: imu
+    xyz: [0.0, 0.0, 0.0]
+    rpy: [0.0, 0.0, 0.0]
+  gnss:
+    child_frame: gnss
+    xyz: [0.0, 1.0, 0.0]   # primary antenna, 1 m port of IMU
+    rpy: [0.0, 0.0, 0.0]
+  aux1:
+    child_frame: aux1
+    xyz: [0.0, -1.0, 0.0]  # secondary antenna, 1 m starboard of IMU
+    rpy: [0.0, 0.0, 0.0]
+  vsm:
+    child_frame: vsm
+    xyz: [0.0, 0.0, 0.0]
+    rpy: [0.0, 0.0, 0.0]

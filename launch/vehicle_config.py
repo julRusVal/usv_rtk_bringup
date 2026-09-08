@@ -1,4 +1,5 @@
 """Load USV vehicle YAML config and build static transforms."""
+import copy
 import os
 import tempfile
 
@@ -9,6 +10,186 @@ from ament_index_python.packages import get_package_share_directory
 def default_vehicle_config_path():
     pkg_share = get_package_share_directory('usv_rtk_bringup')
     return os.path.join(pkg_share, 'config', 'usv.yaml')
+
+
+def resolve_config_path(path, pkg_share=None):
+    """Resolve package-relative config path to an absolute path."""
+    if not path:
+        return ''
+    if os.path.isabs(path):
+        return path
+    if pkg_share is None:
+        pkg_share = get_package_share_directory('usv_rtk_bringup')
+    candidate = os.path.join(pkg_share, path)
+    if os.path.isfile(candidate):
+        return candidate
+    return path
+
+
+def resolve_sbg(config):
+    sbg = dict(config.get('sbg', {}))
+    sbg.setdefault('serial_device', '/dev/usv-sbg')
+    sbg.setdefault('serial_baudrate', 115200)
+    return sbg
+
+
+def _xyz_tuple(frame):
+    xyz = frame.get('xyz', [0.0, 0.0, 0.0])
+    return float(xyz[0]), float(xyz[1]), float(xyz[2])
+
+
+def flu_xyz_to_sbg_frd(x, y, z):
+    """Convert ROS FLU offsets (imu/base_link) to SBG IMU FRD lever arms.
+
+    SBG Ellipse alignment in sbg_floatsam0.yaml uses axisDirectionX=FORWARD,
+    axisDirectionY=RIGHT (FRD). Vehicle extrinsics are stored in ROS FLU.
+    """
+    return float(x), float(-y), float(-z)
+
+
+def build_sbg_param_overlay(config):
+    """Merge vehicle YAML (extrinsics, sbg serial) into sbg_driver ROS parameters."""
+    extrinsics = resolve_extrinsics(config)
+    sbg = resolve_sbg(config)
+    gnss = extrinsics['gnss']
+    aux1 = extrinsics['aux1']
+    imu = extrinsics['imu']
+
+    px, py, pz = flu_xyz_to_sbg_frd(*_xyz_tuple(gnss))
+    sx, sy, sz = flu_xyz_to_sbg_frd(*_xyz_tuple(aux1))
+
+    overlay = {
+        'uartConf.portName': sbg['serial_device'],
+        'uartConf.baudRate': int(sbg['serial_baudrate']),
+        'gnss.primaryLeverArmX': px,
+        'gnss.primaryLeverArmY': py,
+        'gnss.primaryLeverArmZ': pz,
+        'gnss.secondaryLeverArmX': sx,
+        'gnss.secondaryLeverArmY': sy,
+        'gnss.secondaryLeverArmZ': sz,
+        'output.frame_id': imu.get('child_frame', 'imu'),
+        'output.gps_frame_id': gnss.get('child_frame', 'gnss'),
+    }
+
+    if any(v != 0.0 for v in (sx, sy, sz)):
+        overlay['gnss.secondaryLeverMode'] = 3
+
+    return overlay
+
+
+def build_sbg_launch_overlay(
+    vehicle_config,
+    robot_name='',
+    *,
+    rtcm_topic='',
+    nmea_topic='',
+):
+    """Vehicle + robot topic overlay for sbg_driver (launch or merged params file)."""
+    from robot_namespace import (
+        default_nmea_topic,
+        default_rtcm_topic,
+        robot_topic_namespace,
+    )
+
+    if isinstance(vehicle_config, (str, os.PathLike)):
+        vehicle_raw = load_vehicle_config(vehicle_config)
+    else:
+        vehicle_raw = vehicle_config
+
+    resolved_rtcm = default_rtcm_topic(robot_name, rtcm_topic)
+    resolved_nmea = default_nmea_topic(robot_name, nmea_topic)
+    topic_namespace = robot_topic_namespace(robot_name)
+
+    return {
+        **build_sbg_param_overlay(vehicle_raw),
+        'rtcm.namespace': topic_namespace,
+        'rtcm.topic_name': 'rtcm' if topic_namespace else resolved_rtcm.lstrip('/'),
+        'rtcm.subscribe': True,
+        'nmea.publish': True,
+        'nmea.namespace': topic_namespace,
+        'nmea.topic_name': 'nmea' if topic_namespace else resolved_nmea.lstrip('/'),
+    }
+
+
+def nested_from_flat(flat_params):
+    """Turn dotted ROS param keys into a nested dict."""
+    nested = {}
+    for key, value in flat_params.items():
+        parts = key.split('.')
+        node = nested
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = value
+    return nested
+
+
+def deep_merge_dict(base, overlay):
+    """Recursively merge overlay into base (mutates and returns base)."""
+    for key, value in overlay.items():
+        if (
+            key in base
+            and isinstance(base[key], dict)
+            and isinstance(value, dict)
+        ):
+            deep_merge_dict(base[key], value)
+        else:
+            base[key] = copy.deepcopy(value)
+    return base
+
+
+def merge_sbg_driver_params(
+    sbg_params_path,
+    vehicle_config_path,
+    robot_name='',
+    *,
+    rtcm_topic='',
+    nmea_topic='',
+):
+    """Merge sensor YAML + vehicle overlay into one sbg_driver params dict."""
+    with open(sbg_params_path, 'r', encoding='utf-8') as handle:
+        base = yaml.safe_load(handle) or {}
+
+    if '/**' not in base:
+        base['/**'] = {'ros__parameters': {}}
+    if 'ros__parameters' not in base['/**']:
+        base['/**']['ros__parameters'] = {}
+
+    ros_params = base['/**']['ros__parameters']
+
+    overlay_flat = build_sbg_launch_overlay(
+        vehicle_config_path,
+        robot_name,
+        rtcm_topic=rtcm_topic,
+        nmea_topic=nmea_topic,
+    )
+    deep_merge_dict(ros_params, nested_from_flat(overlay_flat))
+
+    return {
+        '/**': {
+            'ros__parameters': ros_params,
+        }
+    }
+
+
+def write_merged_sbg_params(
+    output_path,
+    sbg_params_path,
+    vehicle_config_path,
+    robot_name='',
+    *,
+    rtcm_topic='',
+    nmea_topic='',
+):
+    merged = merge_sbg_driver_params(
+        sbg_params_path,
+        vehicle_config_path,
+        robot_name,
+        rtcm_topic=rtcm_topic,
+        nmea_topic=nmea_topic,
+    )
+    with open(output_path, 'w', encoding='utf-8') as handle:
+        yaml.safe_dump(merged, handle, sort_keys=False)
+    return output_path
 
 
 def load_vehicle_config(path):

@@ -19,6 +19,11 @@ network:
   # Receiver port for aux NMEA/RTCM (sdio/sno commands and rtk.yaml serial_1).
   aux_receiver_port: "USB2"
 
+# SBG Ellipse-D (UART). Install udev/99-usv-sbg.rules for /dev/usv-sbg symlink.
+sbg:
+  serial_device: "/dev/usv-sbg"
+  serial_baudrate: 115200
+
 extrinsics:
   base_frame: base_link
   imu:
