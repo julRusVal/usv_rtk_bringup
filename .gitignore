@@ -1,1 +1,12 @@
 config/secrets.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# ROS / colcon
+install/
+build/
+log/
