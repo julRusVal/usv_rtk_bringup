@@ -1,0 +1,8 @@
+# u-blox ZED-F9P rover (ublox_dgnss / libusb).
+# Namespace: {ROBOT_NAME}/ublox (set ROBOT_NAME in usv-host-setup/config/usv-robot.env.sh).
+# RTCM: subscribe on rtcm_topic (default /{ROBOT_NAME}/rtcm) — publish from ntrip_aux_client.
+ublox:
+  frame_id: ublox_gps
+  device_family: F9P
+  device_serial_string: ""
+  rtcm_topic: ""
