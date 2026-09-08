@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Merge SBG sensor YAML + vehicle overlay into one params file for sbg_driver.
+
+Use when launching sbg_driver directly (without usv_rtk_bringup launch files):
+
+  ros2 run usv_rtk_bringup merge_sbg_params --robot-name floatsam0 -o /tmp/sbg_merged.yaml
+  ros2 run sbg_driver sbg_device --ros-args \\
+    -r __ns:=/floatsam0/sbg \\
+    --params-file /tmp/sbg_merged.yaml
+
+Or print merged YAML to stdout:
+
+  ros2 run usv_rtk_bringup merge_sbg_params --robot-name floatsam0
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import yaml
+
+LAUNCH_DIR = Path(__file__).resolve().parent.parent / 'launch'
+sys.path.insert(0, str(LAUNCH_DIR))
+
+from gnss_stack import default_gnss_stack_path, resolve_gnss_stack  # noqa: E402
+from vehicle_config import merge_sbg_driver_params, write_merged_sbg_params  # noqa: E402
+
+
+def default_pkg_share() -> Path:
+    try:
+        from ament_index_python.packages import get_package_share_directory
+
+        return Path(get_package_share_directory('usv_rtk_bringup'))
+    except Exception:
+        return Path(__file__).resolve().parent.parent
+
+
+def resolve_path(path: str, pkg_share: Path) -> str:
+    if not path:
+        return ''
+    candidate = Path(path)
+    if candidate.is_file():
+        return str(candidate)
+    installed = pkg_share / path
+    if installed.is_file():
+        return str(installed)
+    source = Path(__file__).resolve().parent.parent / path
+    if source.is_file():
+        return str(source)
+    return path
+
+
+def main() -> int:
+    pkg_share = default_pkg_share()
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        '--gnss-stack',
+        default=str(default_gnss_stack_path()),
+        help='gnss_stack.yaml (selects vehicle + sensor params when paths omitted)',
+    )
+    parser.add_argument(
+        '--vehicle-config',
+        default='',
+        help='Per-hull vehicle YAML (default: gnss_stack vehicle_config)',
+    )
+    parser.add_argument(
+        '--sbg-params',
+        default='',
+        help='SBG sensor YAML (default: gnss_stack primary.sbg.params_file)',
+    )
+    parser.add_argument(
+        '--robot-name',
+        default=os.environ.get('ROBOT_NAME', ''),
+        help='Robot namespace prefix for /{robot}/nmea and /{robot}/rtcm',
+    )
+    parser.add_argument(
+        '--rtcm-topic',
+        default='',
+        help='Override RTCM topic (default /{robot_name}/rtcm)',
+    )
+    parser.add_argument(
+        '--nmea-topic',
+        default='',
+        help='Override NMEA topic (default /{robot_name}/nmea)',
+    )
+    parser.add_argument(
+        '-o',
+        '--output',
+        default='',
+        help='Write merged YAML here (default: print to stdout)',
+    )
+    args = parser.parse_args()
+
+    gnss_stack_path = resolve_path(args.gnss_stack, pkg_share)
+    stack = resolve_gnss_stack(
+        gnss_stack_path,
+        module_override='sbg',
+        vehicle_config_override=args.vehicle_config,
+        robot_name=args.robot_name,
+        pkg_share=str(pkg_share),
+    )
+
+    sbg_params = args.sbg_params or stack['sbg_params_file']
+    vehicle_config = args.vehicle_config or stack['sbg_vehicle_config']
+    sbg_params = resolve_path(sbg_params, pkg_share)
+    vehicle_config = resolve_path(vehicle_config, pkg_share)
+
+    if not os.path.isfile(sbg_params):
+        print(f'sbg params file not found: {sbg_params}', file=sys.stderr)
+        return 1
+    if not os.path.isfile(vehicle_config):
+        print(f'vehicle config not found: {vehicle_config}', file=sys.stderr)
+        return 1
+
+    if args.output:
+        out_path = write_merged_sbg_params(
+            args.output,
+            sbg_params,
+            vehicle_config,
+            args.robot_name,
+            rtcm_topic=args.rtcm_topic,
+            nmea_topic=args.nmea_topic,
+        )
+        print(f'Wrote merged SBG params: {out_path}')
+        print(f'  sensor:  {sbg_params}')
+        print(f'  vehicle: {vehicle_config}')
+        print(f'  robot:   {args.robot_name or "(none)"}')
+        return 0
+
+    merged = merge_sbg_driver_params(
+        sbg_params,
+        vehicle_config,
+        args.robot_name,
+        rtcm_topic=args.rtcm_topic,
+        nmea_topic=args.nmea_topic,
+    )
+    yaml.safe_dump(merged, sys.stdout, sort_keys=False)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -1,0 +1,15 @@
+# SBG Ellipse (FTDI USB-RS232 adapter) — stable device name for usv_rtk_bringup.
+#
+# Device: FTDI 0403:6001, serial AU057POW → /dev/usv-sbg
+# Used by config/vehicles/floatsam0.yaml and sbg.launch.py.
+#
+# Install:
+#   sudo cp ~/floatsam_ws/install/usv_rtk_bringup/share/usv_rtk_bringup/udev/99-usv-sbg.rules \
+#     /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Verify after replugging:
+#   ls -l /dev/usv-sbg
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", ATTRS{serial}=="AU057POW", \
+  SYMLINK+="usv-sbg", GROUP="dialout", MODE="0660", TAG+="uaccess"
