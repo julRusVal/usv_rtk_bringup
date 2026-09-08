@@ -4,6 +4,8 @@ This stack injects RTCM from [`ntrip_aux_client`](../utilities/ntrip_aux_client)
 
 Corrections flow through three stages. Use the checks below from **upstream → receiver** depending on what you need to prove.
 
+**One-screen overview:** [`gnss_link_monitor`](gnss_link_monitor.md) shows GNSS fix quality, RTCM rate, and (with `rtk_heading`) dual-antenna heading in a live terminal dashboard.
+
 | Stage | What you prove |
 |-------|----------------|
 | NTRIP client | Caster → host → serial **write** |
@@ -45,11 +47,12 @@ Published RTCM #1 (1074, … bytes) on /rtcm
 ### ROS RTCM topic (optional)
 
 ```bash
-ros2 run usv_rtk_bringup ntrip_aux_client --release-port --publish-rtcm
-ros2 topic hz /rtcm
+ros2 run usv_rtk_bringup ntrip_aux_client --release-port --publish-rtcm \
+  --rtcm-topic /floatsam0/rtcm
+ros2 topic hz /floatsam0/rtcm
 ```
 
-Expect a steady rate (mountpoint-dependent, often ~1 Hz for MSM streams).
+Expect a steady rate (mountpoint-dependent, often ~1 Hz for MSM streams). Or use [`gnss_link_monitor`](gnss_link_monitor.md) for rate, message types, and GNSS fix quality in one view.
 
 ### SWEPOS credential / stream test (no hardware)
 
@@ -159,13 +162,17 @@ If metrics toggle with NTRIP on/off, the receiver **is** receiving and using cor
 ```bash
 # 1. Stack running
 ros2 launch usv_rtk_bringup rtk.launch.py
-ros2 run usv_rtk_bringup ntrip_aux_client --release-port
+ros2 run usv_rtk_bringup ntrip_aux_client --release-port --publish-rtcm \
+  --rtcm-topic /floatsam0/rtcm
 
 # 2. NTRIP connected (terminal 2 logs)
 
-# 3. Receiver using corrections
-ros2 topic echo /septentrio_gnss_driver/pvtgeodetic --field mean_corr_age --field mode
+# 3. Live dashboard (terminal 3) — fix type, RTCM Hz, covariances
+ros2 run usv_rtk_bringup gnss_link_monitor
 
-# 4. Optional cross-check
-ros2 topic echo /septentrio_gnss_driver/gpgga --field quality
+# 4. Or spot-check individual topics
+ros2 topic echo /floatsam0/septentrio/pvtgeodetic --field mean_corr_age --field mode
+ros2 topic echo /floatsam0/septentrio/gpgga --field gps_qual
 ```
+
+See [gnss_link_monitor.md](gnss_link_monitor.md) for options (`--discover`, `--no-rtcm`, dual-antenna heading).
