@@ -1,0 +1,1107 @@
+#!/usr/bin/env python3
+"""Live terminal monitor for GNSS fix quality across multiple sensors."""
+
+from __future__ import annotations
+
+import argparse
+import math
+import signal
+import sys
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Callable
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import NavSatFix, NavSatStatus
+
+try:
+    from gps_msgs.msg import GPSFix
+except ImportError:
+    GPSFix = None  # type: ignore[misc, assignment]
+
+try:
+    from septentrio_gnss_driver.msg import AttCovEuler, AttEuler, PVTGeodetic
+except ImportError:
+    AttCovEuler = None  # type: ignore[misc, assignment]
+    AttEuler = None  # type: ignore[misc, assignment]
+    PVTGeodetic = None  # type: ignore[misc, assignment]
+
+try:
+    from sbg_driver.msg import SbgGpsHdt, SbgGpsPos
+except ImportError:
+    SbgGpsPos = None  # type: ignore[misc, assignment]
+    SbgGpsHdt = None  # type: ignore[misc, assignment]
+
+try:
+    from nmea_msgs.msg import Gpgga
+except ImportError:
+    Gpgga = None  # type: ignore[misc, assignment]
+
+try:
+    from rtcm_msgs.msg import Message as RtcmMessage
+except ImportError:
+    RtcmMessage = None  # type: ignore[misc, assignment]
+
+PVT_MODE_NAMES = {
+    0: 'No PVT',
+    1: 'Standalone',
+    2: 'DGPS',
+    3: 'Fixed',
+    4: 'RTK Fixed',
+    5: 'RTK Float',
+    6: 'SBAS',
+    7: 'MB RTK Fixed',
+    8: 'MB RTK Float',
+    9: 'PPP',
+}
+
+GGA_QUALITY_NAMES = {
+    0: 'Invalid',
+    1: 'Standalone',
+    2: 'DGPS',
+    3: 'PPS',
+    4: 'RTK Fixed',
+    5: 'RTK Float',
+    6: 'Dead reckoning',
+    7: 'Manual',
+    8: 'Simulation',
+}
+
+NAVSAT_STATUS_NAMES = {
+    NavSatStatus.STATUS_NO_FIX: 'No fix',
+    NavSatStatus.STATUS_FIX: 'Fix',
+    NavSatStatus.STATUS_SBAS_FIX: 'SBAS',
+    NavSatStatus.STATUS_GBAS_FIX: 'GBAS/DGNSS',
+}
+
+GPSFIX_STATUS_NAMES = {
+    -1: 'No fix',
+    0: 'Fix',
+    1: 'SBAS',
+    2: 'GBAS',
+    3: 'DGPS',
+    4: 'WAAS',
+    18: 'DGPS',
+    19: 'RTK Fixed',
+    20: 'RTK Float',
+    33: 'WAAS',
+}
+
+COV_TYPE_NAMES = {
+    NavSatFix.COVARIANCE_TYPE_UNKNOWN: 'unknown',
+    NavSatFix.COVARIANCE_TYPE_APPROXIMATED: 'approx',
+    NavSatFix.COVARIANCE_TYPE_DIAGONAL_KNOWN: 'diagonal',
+    NavSatFix.COVARIANCE_TYPE_KNOWN: 'known',
+}
+
+# SBG Ellipse SbgGpsPosStatus.type (sbg_driver/msg/SbgGpsPosStatus.msg)
+SBG_GPS_POS_TYPE_NAMES = {
+    0: 'No solution',
+    1: 'Unknown',
+    2: 'Standalone',
+    3: 'DGPS',
+    4: 'SBAS',
+    5: 'Omnistar',
+    6: 'RTK Float',
+    7: 'RTK Fixed',
+    8: 'PPP Float',
+    9: 'PPP Fixed',
+    10: 'Fixed',
+}
+
+SBG_GPS_HDT_STATUS_NAMES = {
+    0: 'OK',
+    1: 'Insufficient obs',
+    2: 'Internal error',
+    3: 'Height limit',
+}
+
+
+class LiveTerminal:
+    """In-place terminal UI using the alternate screen and per-line clear."""
+
+    def __init__(self) -> None:
+        self._interactive = sys.stdout.isatty()
+        self._prev_lines = 0
+        self._active = False
+
+    def start(self) -> None:
+        if not self._interactive:
+            return
+        sys.stdout.write('\033[?1049h\033[H')
+        sys.stdout.flush()
+        self._active = True
+
+    def update(self, lines: list[str]) -> None:
+        text = '\n'.join(lines)
+        if not self._interactive:
+            sys.stdout.write('\033[2J\033[H' + text + '\n')
+            sys.stdout.flush()
+            return
+
+        sys.stdout.write('\033[H')
+        for line in lines:
+            sys.stdout.write('\033[2K' + line + '\n')
+        for _ in range(max(0, self._prev_lines - len(lines))):
+            sys.stdout.write('\033[2K\n')
+        self._prev_lines = len(lines)
+        sys.stdout.flush()
+
+    def stop(self) -> None:
+        if not self._active:
+            return
+        sys.stdout.write('\033[?1049l')
+        sys.stdout.flush()
+        self._active = False
+
+RTCM_TYPE_NAMES = {
+    1005: 'station ARP',
+    1006: 'station ARP+height',
+    1033: 'receiver info',
+    1074: 'GPS MSM4',
+    1075: 'GPS MSM5',
+    1076: 'GPS MSM6',
+    1077: 'GPS MSM7',
+    1084: 'GLONASS MSM4',
+    1085: 'GLONASS MSM5',
+    1086: 'GLONASS MSM6',
+    1087: 'GLONASS MSM7',
+    1094: 'Galileo MSM4',
+    1095: 'Galileo MSM5',
+    1096: 'Galileo MSM6',
+    1097: 'Galileo MSM7',
+    1124: 'BeiDou MSM4',
+    1125: 'BeiDou MSM5',
+    1126: 'BeiDou MSM6',
+    1127: 'BeiDou MSM7',
+    1230: 'GLONASS bias',
+}
+
+
+@dataclass
+class StreamRate:
+    window_s: float = 5.0
+    times: deque[float] = field(default_factory=deque)
+    sizes: deque[int] = field(default_factory=deque)
+    last_rx: float = 0.0
+    last_size: int = 0
+    last_type: int | None = None
+    recent_types: dict[int, int] = field(default_factory=dict)
+
+    def tick(self, now: float, size: int, msg_type: int | None) -> None:
+        self.times.append(now)
+        self.sizes.append(size)
+        self.last_rx = now
+        self.last_size = size
+        if msg_type is not None:
+            self.last_type = msg_type
+            self.recent_types[msg_type] = self.recent_types.get(msg_type, 0) + 1
+
+        cutoff = now - self.window_s
+        while self.times and self.times[0] < cutoff:
+            self.times.popleft()
+            self.sizes.popleft()
+
+        if not self.times:
+            self.recent_types.clear()
+
+    def hz(self) -> float:
+        if len(self.times) < 2:
+            return 0.0
+        span = self.times[-1] - self.times[0]
+        if span <= 0:
+            return 0.0
+        return (len(self.times) - 1) / span
+
+    def bytes_per_s(self) -> float:
+        if len(self.times) < 2:
+            return 0.0
+        span = self.times[-1] - self.times[0]
+        if span <= 0:
+            return 0.0
+        return sum(self.sizes) / span
+
+
+@dataclass
+class SensorState:
+    topic: str
+    label: str
+    namespace: str | None
+    monitor_heading: bool = False
+    heading_only: bool = False
+    navsatfix: NavSatFix | None = None
+    gpsfix: GPSFix | None = None
+    pvt: PVTGeodetic | None = None
+    gpgga: Gpgga | None = None
+    atteuler: AttEuler | None = None
+    attcoveuler: AttCovEuler | None = None
+    sbg_gps_pos: SbgGpsPos | None = None
+    sbg_gps_hdt: SbgGpsHdt | None = None
+    navsatfix_rx: float = 0.0
+    gpsfix_rx: float = 0.0
+    pvt_rx: float = 0.0
+    gpgga_rx: float = 0.0
+    atteuler_rx: float = 0.0
+    attcoveuler_rx: float = 0.0
+    sbg_gps_pos_rx: float = 0.0
+    sbg_gps_hdt_rx: float = 0.0
+
+
+@dataclass
+class RtcmState:
+    topic: str
+    label: str
+    rate: StreamRate = field(default_factory=StreamRate)
+
+
+def normalize_topic(topic: str) -> str:
+    topic = topic.strip()
+    if not topic.startswith('/'):
+        topic = f'/{topic}'
+    return topic
+
+
+def sensor_namespace(topic: str) -> str | None:
+    """Return /{robot}/{sensor} when the topic follows that layout."""
+    parts = [part for part in topic.strip('/').split('/') if part]
+    if len(parts) >= 3:
+        return f'/{parts[0]}/{parts[1]}'
+    return None
+
+
+def sensor_label(topic: str) -> str:
+    namespace = sensor_namespace(topic)
+    if namespace:
+        return namespace.strip('/')
+    parts = [part for part in topic.strip('/').split('/') if part]
+    if len(parts) >= 2:
+        return '/'.join(parts[-2:])
+    return parts[-1] if parts else topic
+
+
+def namespace_label(namespace: str) -> str:
+    return namespace.strip('/') or namespace
+
+
+def is_sbg_namespace(namespace: str | None) -> bool:
+    if not namespace:
+        return False
+    parts = [part for part in namespace.strip('/').split('/') if part]
+    return len(parts) >= 2 and parts[1] == 'sbg'
+
+
+def sbg_navsat_topic(namespace: str) -> str:
+    return f'{namespace.rstrip("/")}/imu/nav_sat_fix'
+
+
+def companion_topics(navsat_topic: str) -> dict[str, str]:
+    """Map optional companion topics in the same namespace."""
+    base, _, name = navsat_topic.rpartition('/')
+    if not base:
+        return {}
+    companions: dict[str, str] = {}
+    namespace = sensor_namespace(navsat_topic)
+
+    if name == 'navsatfix':
+        companions['gpsfix'] = f'{base}/gpsfix'
+        companions['pvtgeodetic'] = f'{base}/pvtgeodetic'
+        companions['gpgga'] = f'{base}/gpgga'
+    elif name == 'nav_sat_fix' and is_sbg_namespace(namespace):
+        companions['sbg_gps_pos'] = f'{namespace}/sbg/gps_pos'
+        companions['sbg_gps_hdt'] = f'{namespace}/sbg/gps_hdt'
+
+    if namespace is not None and not is_sbg_namespace(namespace):
+        companions['atteuler'] = f'{base}/atteuler'
+        companions['attcoveuler'] = f'{base}/attcoveuler'
+    return companions
+
+
+def discover_navsatfix_topics(node: Node) -> list[str]:
+    topics: list[str] = []
+    for name, types in node.get_topic_names_and_types():
+        if 'sensor_msgs/msg/NavSatFix' in types:
+            topics.append(name)
+    return sorted(topics)
+
+
+def discover_rtcm_topics(node: Node) -> list[str]:
+    topics: list[str] = []
+    for name, types in node.get_topic_names_and_types():
+        if 'rtcm_msgs/msg/Message' in types:
+            topics.append(name)
+    return sorted(topics)
+
+
+def discover_atteuler_topics(node: Node) -> list[str]:
+    if AttEuler is None:
+        return []
+    topics: list[str] = []
+    for name, types in node.get_topic_names_and_types():
+        if 'septentrio_gnss_driver/msg/AttEuler' in types:
+            topics.append(name)
+    return sorted(topics)
+
+
+def discover_sbg_gps_pos_topics(node: Node) -> list[str]:
+    if SbgGpsPos is None:
+        return []
+    topics: list[str] = []
+    for name, types in node.get_topic_names_and_types():
+        if 'sbg_driver/msg/SbgGpsPos' in types:
+            topics.append(name)
+    return sorted(topics)
+
+
+def sbg_gps_pos_namespace(topic: str) -> str | None:
+    parts = [part for part in normalize_topic(topic).strip('/').split('/') if part]
+    if len(parts) >= 3 and parts[-1] == 'gps_pos' and parts[-2] == 'sbg':
+        return f'/{parts[0]}/{parts[1]}'
+    return None
+
+
+def atteuler_namespace(topic: str) -> str | None:
+    base, _, name = normalize_topic(topic).rpartition('/')
+    if name == 'atteuler' and base:
+        return base
+    return None
+
+
+def parse_rtcm_type(payload: bytes) -> int | None:
+    if len(payload) < 3 or payload[0] != 0xD3:
+        return None
+    length = ((payload[1] & 0x03) << 8) | payload[2]
+    if len(payload) < 3 + length:
+        return None
+    body = payload[3 : 3 + length]
+    if len(body) < 2:
+        return None
+    return (body[0] << 4) | (body[1] >> 4)
+
+
+def rtcm_type_label(msg_type: int | None) -> str:
+    if msg_type is None:
+        return 'unknown'
+    return RTCM_TYPE_NAMES.get(msg_type, f'type {msg_type}')
+
+
+def rtcm_recent_types_label(rate: StreamRate, limit: int = 4) -> str:
+    if not rate.recent_types:
+        return '—'
+    ordered = sorted(rate.recent_types.items(), key=lambda item: (-item[1], item[0]))
+    parts = [f'{rtcm_type_label(msg_type)}×{count}' for msg_type, count in ordered[:limit]]
+    if len(ordered) > limit:
+        parts.append('…')
+    return ', '.join(parts)
+
+
+def fmt_coord(value: float | None, width: int = 10, places: int = 7) -> str:
+    if value is None or math.isnan(value):
+        return '—'.rjust(width)
+    return f'{value:>{width}.{places}f}'
+
+
+def fmt_sigma(value: float | None) -> str:
+    if value is None or math.isnan(value) or value < 0:
+        return '—'
+    return f'{math.sqrt(value):.3f}'
+
+
+def fmt_angle(value: float | None, places: int = 2) -> str:
+    if value is None or math.isnan(value):
+        return '—'
+    return f'{value:.{places}f}°'
+
+
+def enu_sigmas(navsatfix: NavSatFix | None) -> tuple[str, str, str]:
+    if navsatfix is None:
+        return '—', '—', '—'
+    cov = navsatfix.position_covariance
+    if len(cov) < 9:
+        return '—', '—', '—'
+    return fmt_sigma(cov[0]), fmt_sigma(cov[4]), fmt_sigma(cov[8])
+
+
+def fix_type_label(state: SensorState) -> str:
+    if state.pvt is not None:
+        mode = int(state.pvt.mode) & 0x0F
+        label = PVT_MODE_NAMES.get(mode, f'mode {mode}')
+        if state.pvt.mean_corr_age > 0:
+            age_s = state.pvt.mean_corr_age * 0.01
+            label = f'{label} (corr {age_s:.1f}s)'
+        return label
+
+    if state.sbg_gps_pos is not None:
+        pos_type = int(state.sbg_gps_pos.status.type)
+        label = SBG_GPS_POS_TYPE_NAMES.get(pos_type, f'type {pos_type}')
+        sol_status = int(state.sbg_gps_pos.status.status)
+        if sol_status != 0:
+            label = f'{label} ({SBG_GPS_HDT_STATUS_NAMES.get(sol_status, f"status {sol_status}")})'
+        if state.sbg_gps_pos.diff_age > 0:
+            label = f'{label} (corr {state.sbg_gps_pos.diff_age * 0.01:.1f}s)'
+        return label
+
+    if state.gpgga is not None:
+        quality = int(state.gpgga.gps_qual)
+        return GGA_QUALITY_NAMES.get(quality, f'GGA {quality}')
+
+    if state.gpsfix is not None:
+        status = int(state.gpsfix.status.status)
+        return GPSFIX_STATUS_NAMES.get(status, f'GPSFix {status}')
+
+    if state.navsatfix is not None:
+        status = int(state.navsatfix.status.status)
+        return NAVSAT_STATUS_NAMES.get(status, f'NavSat {status}')
+
+    return 'waiting'
+
+
+def signal_summary(state: SensorState) -> str:
+    parts: list[str] = []
+
+    if state.pvt is not None:
+        parts.append(f'SVs {state.pvt.nr_sv}')
+        if state.pvt.h_accuracy > 0:
+            parts.append(f'σH {state.pvt.h_accuracy * 0.01:.2f} m')
+        if state.pvt.v_accuracy > 0:
+            parts.append(f'σV {state.pvt.v_accuracy * 0.01:.2f} m')
+        if state.pvt.nr_bases > 0:
+            parts.append(f'bases {state.pvt.nr_bases}')
+    elif state.gpsfix is not None:
+        if state.gpsfix.err_horz >= 0:
+            parts.append(f'σH {state.gpsfix.err_horz:.2f} m')
+        if state.gpsfix.err_vert >= 0:
+            parts.append(f'σV {state.gpsfix.err_vert:.2f} m')
+        if state.gpsfix.hdop >= 0:
+            parts.append(f'HDOP {state.gpsfix.hdop:.1f}')
+    elif state.sbg_gps_pos is not None:
+        pos = state.sbg_gps_pos
+        if pos.num_sv_used not in (0, 0xFF):
+            parts.append(f'SVs {pos.num_sv_used}')
+        acc = pos.position_accuracy
+        if acc.x > 0 or acc.y > 0:
+            parts.append(f'σE/N {acc.x:.2f}/{acc.y:.2f} m')
+        if acc.z > 0:
+            parts.append(f'σU {acc.z:.2f} m')
+        if pos.base_station_id > 0:
+            parts.append(f'base {pos.base_station_id}')
+
+    if not parts:
+        nav = state.navsatfix
+        if nav is not None and nav.position_covariance_type != NavSatFix.COVARIANCE_TYPE_UNKNOWN:
+            sigma_e, sigma_n, sigma_u = enu_sigmas(nav)
+            parts.append(f'σE/N/U {sigma_e}/{sigma_n}/{sigma_u} m')
+
+    return ' · '.join(parts) if parts else '—'
+
+
+def heading_summary(state: SensorState) -> str | None:
+    if not state.monitor_heading:
+        return None
+
+    hdt = state.sbg_gps_hdt
+    if hdt is not None:
+        status = int(hdt.status) & 0x3F
+        if status != 0:
+            return SBG_GPS_HDT_STATUS_NAMES.get(status, f'error {status}')
+        parts = [
+            f'h {fmt_angle(hdt.true_heading)}',
+            f'pitch {fmt_angle(hdt.pitch)}',
+            f'baseline {hdt.baseline:.2f} m',
+        ]
+        if hdt.num_sv_used not in (0, 0xFF):
+            parts.append(f'SVs {hdt.num_sv_used}')
+        if hdt.true_heading_acc > 0:
+            parts.append(f'σ_h {hdt.true_heading_acc:.2f}°')
+        return '  '.join(parts)
+
+    att = state.atteuler
+    if att is None:
+        return 'waiting'
+
+    if int(att.error) != 0:
+        return f'error {att.error} (mode {att.mode})'
+
+    parts = [
+        f'h {fmt_angle(att.heading)}',
+        f'pitch {fmt_angle(att.pitch)}',
+        f'roll {fmt_angle(att.roll)}',
+    ]
+    if att.nr_sv > 0:
+        parts.append(f'SVs {att.nr_sv}')
+    if state.attcoveuler is not None and state.attcoveuler.cov_headhead >= 0:
+        parts.append(f'σ_h {math.sqrt(state.attcoveuler.cov_headhead):.2f}°')
+    parts.append(f'mode {att.mode}')
+    return '  '.join(parts)
+
+
+def age_s(now: float, last_rx: float) -> str:
+    if last_rx <= 0:
+        return 'never'
+    delta = now - last_rx
+    if delta < 1.0:
+        return f'{delta * 1000:.0f} ms'
+    return f'{delta:.1f} s'
+
+
+def build_sensor_block(state: SensorState, now: float) -> list[str]:
+    topic_line = state.topic
+    if state.namespace and state.heading_only:
+        topic_line = f'{state.namespace}/atteuler (no NavSatFix yet)'
+
+    lines = [f'[{state.label}]  {topic_line}']
+
+    if state.heading_only:
+        heading = heading_summary(state)
+        updated = state.atteuler_rx if state.atteuler_rx > 0 else state.sbg_gps_hdt_rx
+        lines.append(f'  Heading:  {heading or "waiting"}')
+        lines.append(f'  Updated:  {age_s(now, updated)} ago')
+        return lines
+
+    nav = state.navsatfix
+    if nav is None and state.sbg_gps_pos is not None:
+        nav_lat = state.sbg_gps_pos.latitude
+        nav_lon = state.sbg_gps_pos.longitude
+        nav_alt = state.sbg_gps_pos.altitude
+    else:
+        nav_lat = nav.latitude if nav else None
+        nav_lon = nav.longitude if nav else None
+        nav_alt = nav.altitude if nav else None
+    sigma_e, sigma_n, sigma_u = enu_sigmas(nav)
+    cov_type = '—'
+    if nav is not None:
+        cov_type = COV_TYPE_NAMES.get(nav.position_covariance_type, str(nav.position_covariance_type))
+
+    lines.extend([
+        f'  Fix:      {fix_type_label(state)}',
+        f'  Position: lat {fmt_coord(nav_lat)}  '
+        f'lon {fmt_coord(nav_lon)}  '
+        f'alt {fmt_coord(nav_alt, places=2)} m',
+        f'  Cov ENU:  σE {sigma_e} m   σN {sigma_n} m   σU {sigma_u} m   ({cov_type})',
+        f'  Quality:  {signal_summary(state)}',
+    ])
+
+    heading = heading_summary(state)
+    if heading is not None:
+        lines.append(f'  Heading:  {heading}')
+
+    updated = state.navsatfix_rx
+    if updated <= 0 and state.sbg_gps_pos_rx > 0:
+        updated = state.sbg_gps_pos_rx
+    lines.append(f'  Updated:  {age_s(now, updated)} ago')
+    return lines
+
+
+def build_rtcm_block(state: RtcmState, now: float) -> list[str]:
+    rate = state.rate
+    hz = rate.hz()
+    bps = rate.bytes_per_s()
+    activity = 'active' if hz > 0.05 else 'idle'
+    last = '—'
+    if rate.last_type is not None:
+        last = f'{rtcm_type_label(rate.last_type)}  {rate.last_size} B'
+
+    return [
+        f'[{state.label}]  {state.topic}',
+        f'  Rate:     {hz:.2f} Hz  ({bps:.0f} B/s)  {activity}',
+        f'  Last:     {last}  ({age_s(now, rate.last_rx)} ago)',
+        f'  Recent:   {rtcm_recent_types_label(rate)}',
+    ]
+
+
+class GnssLinkMonitor(Node):
+    def __init__(
+        self,
+        topics: list[str],
+        rtcm_topics: list[str],
+        *,
+        refresh_hz: float,
+        discover: bool,
+        discover_rtcm: bool,
+        discover_interval: float,
+        monitor_rtcm: bool,
+    ) -> None:
+        super().__init__('gnss_link_monitor')
+        self._refresh_hz = refresh_hz
+        self._discover = discover
+        self._discover_rtcm = discover_rtcm
+        self._discover_interval = discover_interval
+        self._monitor_rtcm = monitor_rtcm
+        self._explicit_topics = {normalize_topic(topic) for topic in topics}
+        self._explicit_rtcm_topics = {normalize_topic(topic) for topic in rtcm_topics}
+        self._states: dict[str, SensorState] = {}
+        self._rtcm_states: dict[str, RtcmState] = {}
+        self._subscriptions: list = []
+        self._heading_attached: set[str] = set()
+        self._terminal = LiveTerminal()
+        self._last_discovery = 0.0
+        self._started = time.monotonic()
+
+        if self._explicit_topics:
+            self._attach_gnss_topics(sorted(self._explicit_topics))
+        elif discover:
+            self._rediscover(force=True)
+
+        if self._monitor_rtcm:
+            if self._explicit_rtcm_topics:
+                self._attach_rtcm_topics(sorted(self._explicit_rtcm_topics))
+            elif discover_rtcm:
+                self._rediscover_rtcm(force=True)
+
+        self._terminal.start()
+        self.create_timer(1.0 / refresh_hz, self._render)
+
+    def _rediscover(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - self._last_discovery) < self._discover_interval:
+            return
+        self._last_discovery = now
+        discovered = set(discover_navsatfix_topics(self))
+        desired = discovered | self._explicit_topics
+        current = set(self._states)
+        for topic in sorted(desired - current):
+            self._attach_gnss_topics([topic])
+        for topic in sorted(current - desired):
+            self._detach_gnss_topic(topic)
+
+        if self._monitor_rtcm and self._discover_rtcm and not self._explicit_rtcm_topics:
+            self._rediscover_rtcm(force=True)
+
+        if self._discover and AttEuler is not None:
+            self._rediscover_atteuler()
+
+        if self._discover and SbgGpsPos is not None:
+            self._rediscover_sbg()
+
+    def _rediscover_rtcm(self, *, force: bool = False) -> None:
+        if not RtcmMessage:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_discovery) < self._discover_interval:
+            return
+        discovered = set(discover_rtcm_topics(self))
+        desired = discovered | self._explicit_rtcm_topics
+        current = set(self._rtcm_states)
+        for topic in sorted(desired - current):
+            self._attach_rtcm_topics([topic])
+        for topic in sorted(current - desired):
+            self._detach_rtcm_topic(topic)
+
+    def _rediscover_atteuler(self) -> None:
+        for topic in discover_atteuler_topics(self):
+            namespace = atteuler_namespace(topic)
+            if not namespace or is_sbg_namespace(namespace):
+                continue
+            if any(state.namespace == namespace for state in self._states.values()):
+                continue
+            self._attach_heading_only(namespace, topic)
+
+    def _rediscover_sbg(self) -> None:
+        for topic in discover_sbg_gps_pos_topics(self):
+            namespace = sbg_gps_pos_namespace(topic)
+            if not namespace:
+                continue
+            navsat = sbg_navsat_topic(namespace)
+            if navsat in self._states or navsat in self._explicit_topics:
+                continue
+            self._attach_gnss_topics([navsat])
+
+    def _attach_heading_only(self, namespace: str, atteuler_topic: str) -> None:
+        key = f'heading:{namespace}'
+        if key in self._states:
+            return
+        state = SensorState(
+            topic=atteuler_topic,
+            label=namespace_label(namespace),
+            namespace=namespace,
+            monitor_heading=True,
+            heading_only=True,
+        )
+        self._states[key] = state
+        self._attach_attitude_subscriptions(key, namespace)
+
+    def _attach_attitude_subscriptions(self, state_key: str, namespace: str) -> None:
+        if namespace in self._heading_attached:
+            return
+        self._heading_attached.add(namespace)
+        if AttEuler is not None:
+            self._subscriptions.append(
+                self.create_subscription(
+                    AttEuler,
+                    f'{namespace}/atteuler',
+                    self._make_atteuler_cb(state_key),
+                    qos_profile_sensor_data,
+                )
+            )
+        if AttCovEuler is not None:
+            self._subscriptions.append(
+                self.create_subscription(
+                    AttCovEuler,
+                    f'{namespace}/attcoveuler',
+                    self._make_attcoveuler_cb(state_key),
+                    qos_profile_sensor_data,
+                )
+            )
+
+    def _attach_gnss_topics(self, topics: list[str]) -> None:
+        for topic in topics:
+            topic = normalize_topic(topic)
+            if topic in self._states:
+                continue
+            namespace = sensor_namespace(topic)
+            state = SensorState(
+                topic=topic,
+                label=sensor_label(topic),
+                namespace=namespace,
+                monitor_heading=namespace is not None,
+            )
+            self._states[topic] = state
+            self._subscriptions.append(
+                self.create_subscription(
+                    NavSatFix,
+                    topic,
+                    self._make_navsatfix_cb(topic),
+                    qos_profile_sensor_data,
+                )
+            )
+
+            if namespace is not None and not is_sbg_namespace(namespace):
+                self._attach_attitude_subscriptions(topic, namespace)
+
+            for kind, companion in companion_topics(topic).items():
+                if kind == 'gpsfix' and GPSFix is not None:
+                    self._subscriptions.append(
+                        self.create_subscription(
+                            GPSFix,
+                            companion,
+                            self._make_gpsfix_cb(topic),
+                            qos_profile_sensor_data,
+                        )
+                    )
+                elif kind == 'pvtgeodetic' and PVTGeodetic is not None:
+                    self._subscriptions.append(
+                        self.create_subscription(
+                            PVTGeodetic,
+                            companion,
+                            self._make_pvt_cb(topic),
+                            qos_profile_sensor_data,
+                        )
+                    )
+                elif kind == 'gpgga' and Gpgga is not None:
+                    self._subscriptions.append(
+                        self.create_subscription(
+                            Gpgga,
+                            companion,
+                            self._make_gpgga_cb(topic),
+                            qos_profile_sensor_data,
+                        )
+                    )
+                elif kind == 'sbg_gps_pos' and SbgGpsPos is not None:
+                    self._subscriptions.append(
+                        self.create_subscription(
+                            SbgGpsPos,
+                            companion,
+                            self._make_sbg_gps_pos_cb(topic),
+                            qos_profile_sensor_data,
+                        )
+                    )
+                elif kind == 'sbg_gps_hdt' and SbgGpsHdt is not None:
+                    self._subscriptions.append(
+                        self.create_subscription(
+                            SbgGpsHdt,
+                            companion,
+                            self._make_sbg_gps_hdt_cb(topic),
+                            qos_profile_sensor_data,
+                        )
+                    )
+
+    def _attach_rtcm_topics(self, topics: list[str]) -> None:
+        if not RtcmMessage:
+            return
+        for topic in topics:
+            topic = normalize_topic(topic)
+            if topic in self._rtcm_states:
+                continue
+            self._rtcm_states[topic] = RtcmState(topic=topic, label=sensor_label(topic))
+            self._subscriptions.append(
+                self.create_subscription(
+                    RtcmMessage,
+                    topic,
+                    self._make_rtcm_cb(topic),
+                    qos_profile_sensor_data,
+                )
+            )
+
+    def _detach_gnss_topic(self, topic: str) -> None:
+        self._states.pop(topic, None)
+
+    def _detach_rtcm_topic(self, topic: str) -> None:
+        self._rtcm_states.pop(topic, None)
+
+    def _make_navsatfix_cb(self, topic: str) -> Callable[[NavSatFix], None]:
+        def callback(msg: NavSatFix) -> None:
+            state = self._states[topic]
+            state.navsatfix = msg
+            state.navsatfix_rx = time.monotonic()
+
+        return callback
+
+    def _make_gpsfix_cb(self, topic: str) -> Callable[[GPSFix], None]:
+        def callback(msg: GPSFix) -> None:
+            state = self._states[topic]
+            state.gpsfix = msg
+            state.gpsfix_rx = time.monotonic()
+
+        return callback
+
+    def _make_pvt_cb(self, topic: str) -> Callable[[PVTGeodetic], None]:
+        def callback(msg: PVTGeodetic) -> None:
+            state = self._states[topic]
+            state.pvt = msg
+            state.pvt_rx = time.monotonic()
+
+        return callback
+
+    def _make_gpgga_cb(self, topic: str) -> Callable[[Gpgga], None]:
+        def callback(msg: Gpgga) -> None:
+            state = self._states[topic]
+            state.gpgga = msg
+            state.gpgga_rx = time.monotonic()
+
+        return callback
+
+    def _make_sbg_gps_pos_cb(self, topic: str) -> Callable[[SbgGpsPos], None]:
+        def callback(msg: SbgGpsPos) -> None:
+            state = self._states[topic]
+            state.sbg_gps_pos = msg
+            state.sbg_gps_pos_rx = time.monotonic()
+
+        return callback
+
+    def _make_sbg_gps_hdt_cb(self, topic: str) -> Callable[[SbgGpsHdt], None]:
+        def callback(msg: SbgGpsHdt) -> None:
+            state = self._states[topic]
+            state.sbg_gps_hdt = msg
+            state.sbg_gps_hdt_rx = time.monotonic()
+
+        return callback
+
+    def _make_atteuler_cb(self, state_key: str) -> Callable[[AttEuler], None]:
+        def callback(msg: AttEuler) -> None:
+            state = self._states[state_key]
+            state.atteuler = msg
+            state.atteuler_rx = time.monotonic()
+
+        return callback
+
+    def _make_attcoveuler_cb(self, state_key: str) -> Callable[[AttCovEuler], None]:
+        def callback(msg: AttCovEuler) -> None:
+            state = self._states[state_key]
+            state.attcoveuler = msg
+            state.attcoveuler_rx = time.monotonic()
+
+        return callback
+
+    def _make_rtcm_cb(self, topic: str) -> Callable[[RtcmMessage], None]:
+        def callback(msg: RtcmMessage) -> None:
+            state = self._rtcm_states[topic]
+            payload = bytes(msg.message)
+            msg_type = parse_rtcm_type(payload)
+            state.rate.tick(time.monotonic(), len(payload), msg_type)
+
+        return callback
+
+    def _render(self) -> None:
+        if self._discover and not self._explicit_topics:
+            self._rediscover()
+        else:
+            if self._discover and AttEuler is not None:
+                self._rediscover_atteuler()
+            if self._discover and SbgGpsPos is not None:
+                self._rediscover_sbg()
+
+        if self._monitor_rtcm and self._discover_rtcm and not self._explicit_rtcm_topics:
+            self._rediscover_rtcm()
+
+        now = time.monotonic()
+        uptime = now - self._started
+        lines = [
+            'GNSS link monitor',
+            f'uptime {uptime:.0f}s · refresh {self._refresh_hz:.1f} Hz · '
+            f'GNSS {len(self._states)} · RTCM {len(self._rtcm_states)}',
+            '',
+        ]
+
+        if not self._states:
+            lines.append('No NavSatFix topics found.')
+            if self._discover:
+                lines.append('Waiting for NavSatFix / AttEuler publishers …')
+            else:
+                lines.append('Pass --topic or use default discovery (omit --no-discover).')
+        else:
+            lines.append('GNSS sensors')
+            ordered = sorted(self._states.values(), key=lambda state: state.label)
+            for index, state in enumerate(ordered):
+                if index:
+                    lines.append('')
+                lines.extend(build_sensor_block(state, now))
+
+        if self._monitor_rtcm:
+            lines.append('')
+            if not self._rtcm_states:
+                lines.append('RTCM streams')
+                if RtcmMessage is None:
+                    lines.append('rtcm_msgs not available.')
+                elif self._discover_rtcm or self._explicit_rtcm_topics:
+                    lines.append('Waiting for rtcm_msgs/msg/Message publishers …')
+                else:
+                    lines.append('Pass --rtcm-topic or use default discovery.')
+            else:
+                lines.append('RTCM streams')
+                for index, topic in enumerate(sorted(self._rtcm_states)):
+                    if index:
+                        lines.append('')
+                    lines.extend(build_rtcm_block(self._rtcm_states[topic], now))
+
+        lines.append('')
+        lines.append('Ctrl-C to exit')
+
+        self._terminal.update(lines)
+
+    def close(self) -> None:
+        self._terminal.stop()
+
+
+def _shutdown_node(node: GnssLinkMonitor) -> None:
+    node.close()
+    if not rclpy.ok():
+        return
+    try:
+        node.destroy_node()
+    except (ValueError, RuntimeError):
+        pass
+    if rclpy.ok():
+        rclpy.shutdown()
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            'Examples:\n'
+            '  ros2 run usv_rtk_bringup gnss_link_monitor\n'
+            '  ros2 run usv_rtk_bringup gnss_link_monitor --topic /floatsam0/septentrio/navsatfix\n'
+            '  ros2 run usv_rtk_bringup gnss_link_monitor --topic /floatsam0/sbg/imu/nav_sat_fix\n'
+            '  ros2 run usv_rtk_bringup gnss_link_monitor --discover\n'
+            '  ros2 run usv_rtk_bringup gnss_link_monitor --rtcm-topic /floatsam0/rtcm\n'
+        ),
+    )
+    parser.add_argument(
+        '--topic',
+        dest='topics',
+        action='append',
+        default=[],
+        metavar='TOPIC',
+        help='NavSatFix topic to monitor (repeatable). Disables auto-discovery.',
+    )
+    parser.add_argument(
+        '--rtcm-topic',
+        dest='rtcm_topics',
+        action='append',
+        default=[],
+        metavar='TOPIC',
+        help='RTCM topic to monitor (repeatable). Disables RTCM auto-discovery.',
+    )
+    parser.add_argument(
+        '--rate',
+        type=float,
+        default=2.0,
+        help='Terminal refresh rate in Hz (default: 2)',
+    )
+    parser.add_argument(
+        '--discover-interval',
+        type=float,
+        default=3.0,
+        help='Seconds between topic discovery scans (default: 3)',
+    )
+    discover = parser.add_mutually_exclusive_group()
+    discover.add_argument(
+        '--discover',
+        dest='discover',
+        action='store_true',
+        help='Auto-discover NavSatFix, AttEuler, and RTCM topics (default)',
+    )
+    discover.add_argument(
+        '--no-discover',
+        dest='discover',
+        action='store_false',
+        help='Do not scan the graph; requires --topic / --rtcm-topic',
+    )
+    parser.add_argument(
+        '--no-rtcm',
+        action='store_true',
+        help='Disable RTCM stream monitoring',
+    )
+    parser.set_defaults(discover=True)
+    return parser.parse_args(argv)
+
+
+def resolve_topics(args: argparse.Namespace) -> tuple[list[str], bool]:
+    if args.topics:
+        return [normalize_topic(topic) for topic in args.topics], False
+    if args.discover is False:
+        return [], False
+    return [], True
+
+
+def resolve_rtcm_topics(args: argparse.Namespace) -> tuple[list[str], bool]:
+    if args.no_rtcm:
+        return [], False
+    if args.rtcm_topics:
+        return [normalize_topic(topic) for topic in args.rtcm_topics], False
+    if args.discover is False:
+        return [], False
+    return [], True
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    topics, discover = resolve_topics(args)
+    rtcm_topics, discover_rtcm = resolve_rtcm_topics(args)
+
+    if args.rate <= 0:
+        print('--rate must be > 0', file=sys.stderr)
+        return 2
+
+    rclpy.init(args=argv)
+    node = GnssLinkMonitor(
+        topics,
+        rtcm_topics,
+        refresh_hz=args.rate,
+        discover=discover,
+        discover_rtcm=discover_rtcm,
+        discover_interval=max(args.discover_interval, 0.5),
+        monitor_rtcm=not args.no_rtcm,
+    )
+
+    def shutdown_handler(_signum, _frame) -> None:
+        node.close()
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _shutdown_node(node)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
