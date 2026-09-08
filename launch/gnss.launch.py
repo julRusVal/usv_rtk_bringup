@@ -8,7 +8,12 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from septentrio_launch import launch_arg, make_septentrio_driver_actions  # noqa: E402
+from robot_namespace import (  # noqa: E402
+    declare_namespace_override_argument,
+    declare_robot_name_argument,
+    launch_arg,
+)
+from septentrio_launch import make_septentrio_driver_actions  # noqa: E402
 from vehicle_config import default_vehicle_config_path  # noqa: E402
 
 
@@ -36,6 +41,8 @@ def generate_launch_description():
     default_aux_nmea_cmd = os.path.join(pkg_dir, 'config', 'gnss_aux_nmea.cmd')
 
     return LaunchDescription([
+        declare_robot_name_argument(),
+        declare_namespace_override_argument('septentrio'),
         DeclareLaunchArgument(
             'vehicle_config',
             default_value=default_vehicle_config_path(),

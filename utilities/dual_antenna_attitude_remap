@@ -45,9 +45,9 @@ class DualAntennaAttitudeRemapNode(Node):
     def __init__(self) -> None:
         super().__init__('dual_antenna_attitude_remap')
 
-        self.declare_parameter('output_prefix', '/septentrio_rtk')
-        self.declare_parameter('input_topic', '/atteuler')
-        self.declare_parameter('cov_input_topic', '/attcoveuler')
+        self.declare_parameter('output_prefix', '')
+        self.declare_parameter('input_topic', 'atteuler')
+        self.declare_parameter('cov_input_topic', 'attcoveuler')
         self.declare_parameter('publish_imu', True)
         self.declare_parameter('gnss_frame', 'gnss')
         self.declare_parameter('aux1_frame', 'aux1')
@@ -60,6 +60,9 @@ class DualAntennaAttitudeRemapNode(Node):
         input_topic = self.get_parameter('input_topic').get_parameter_value().string_value
         cov_input_topic = self.get_parameter('cov_input_topic').get_parameter_value().string_value
         publish_imu = self.get_parameter('publish_imu').get_parameter_value().bool_value
+
+        def output_topic(suffix):
+            return f'{prefix}/{suffix}' if prefix else suffix
         self._body_frame = self.get_parameter('body_frame').get_parameter_value().string_value
         self._gnss_frame = self.get_parameter('gnss_frame').get_parameter_value().string_value
         self._aux1_frame = self.get_parameter('aux1_frame').get_parameter_value().string_value
@@ -80,12 +83,12 @@ class DualAntennaAttitudeRemapNode(Node):
         self._resolved_mount: ResolvedMount | None = None
         self._latest_cov: AttCovEuler | None = None
 
-        self._pub_heading = self.create_publisher(Float64, f'{prefix}/heading', 10)
-        self._pub_yaw = self.create_publisher(Float64, f'{prefix}/yaw', 10)
-        self._pub_pitch = self.create_publisher(Float64, f'{prefix}/pitch', 10)
-        self._pub_roll = self.create_publisher(Float64, f'{prefix}/roll', 10)
+        self._pub_heading = self.create_publisher(Float64, output_topic('heading'), 10)
+        self._pub_yaw = self.create_publisher(Float64, output_topic('yaw'), 10)
+        self._pub_pitch = self.create_publisher(Float64, output_topic('pitch'), 10)
+        self._pub_roll = self.create_publisher(Float64, output_topic('roll'), 10)
         self._pub_imu = (
-            self.create_publisher(Imu, f'{prefix}/imu', 10) if publish_imu else None
+            self.create_publisher(Imu, output_topic('imu'), 10) if publish_imu else None
         )
 
         self.create_subscription(
@@ -102,9 +105,9 @@ class DualAntennaAttitudeRemapNode(Node):
                 qos_profile_sensor_data,
             )
 
-        outputs = f'{prefix}/{{heading,yaw,pitch,roll}}'
+        outputs = ', '.join(output_topic(name) for name in ('heading', 'yaw', 'pitch', 'roll'))
         if publish_imu:
-            outputs += f', {prefix}/imu'
+            outputs += f', {output_topic("imu")}'
         self.get_logger().info(
             f'Publishing body-frame attitude on {outputs} from {input_topic}'
         )

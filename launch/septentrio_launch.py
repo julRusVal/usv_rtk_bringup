@@ -2,9 +2,13 @@
 
 import os
 
-from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+from robot_namespace import (
+    SENSOR_SEPTENTRIO,
+    launch_arg,
+    resolve_sensor_namespace,
+)
 from vehicle_config import (
     aux_nmea_commands,
     default_vehicle_config_path,
@@ -12,10 +16,6 @@ from vehicle_config import (
     static_transform_nodes,
     write_temp_commands,
 )
-
-
-def launch_arg(context, name):
-    return LaunchConfiguration(name).perform(context)
 
 
 def filtered_custom_commands_file(source_path, prefix='aux_nmea_'):
@@ -94,10 +94,13 @@ def make_septentrio_driver_actions(
     if aux_cmd:
         param_overlay['custom_commands_file'] = aux_cmd
 
+    namespace = resolve_sensor_namespace(context, SENSOR_SEPTENTRIO)
+
     driver_node = Node(
         package='septentrio_gnss_driver',
         executable='septentrio_gnss_driver_node',
         name='septentrio_gnss_driver',
+        namespace=namespace,
         emulate_tty=True,
         sigterm_timeout='20',
         parameters=[*params_files, param_overlay],

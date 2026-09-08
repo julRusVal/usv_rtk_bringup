@@ -9,7 +9,14 @@ from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch_ros.actions import Node
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from septentrio_launch import launch_arg, make_septentrio_driver_actions  # noqa: E402
+from robot_namespace import (  # noqa: E402
+    SENSOR_SEPTENTRIO,
+    declare_namespace_override_argument,
+    declare_robot_name_argument,
+    launch_arg,
+    resolve_sensor_namespace,
+)
+from septentrio_launch import make_septentrio_driver_actions  # noqa: E402
 from vehicle_config import default_vehicle_config_path  # noqa: E402
 
 
@@ -38,8 +45,14 @@ def launch_setup(context, *args, **kwargs):
             package='usv_rtk_bringup',
             executable='dual_antenna_attitude_remap',
             name='dual_antenna_attitude_remap',
+            namespace=resolve_sensor_namespace(context, SENSOR_SEPTENTRIO),
             output='screen',
-            parameters=[{'vehicle_config': vehicle_config}],
+            parameters=[{
+                'vehicle_config': vehicle_config,
+                'input_topic': 'atteuler',
+                'cov_input_topic': 'attcoveuler',
+                'output_prefix': '',
+            }],
         )
     )
     return actions
@@ -51,6 +64,8 @@ def generate_launch_description():
     default_rtk_heading_params = os.path.join(pkg_dir, 'config', 'rtk_heading.yaml')
 
     return LaunchDescription([
+        declare_robot_name_argument(),
+        declare_namespace_override_argument('septentrio'),
         DeclareLaunchArgument(
             'vehicle_config',
             default_value=default_vehicle_config_path(),
