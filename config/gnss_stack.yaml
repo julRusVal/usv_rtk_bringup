@@ -3,7 +3,7 @@
 
 # Per-hull geometry + SBG serial (merged into driver at launch).
 # Septentrio still uses config/usv.yaml via its launch files — TODO: unify vehicle YAML.
-vehicle_config: config/vehicles/floatsam0.yaml
+vehicle_config: config/vehicles/floatsam_usv_0.yaml
 
 primary:
   module: sbg   # septentrio | sbg | ublox

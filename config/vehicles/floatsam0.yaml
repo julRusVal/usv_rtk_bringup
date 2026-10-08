@@ -5,7 +5,8 @@
 # sbg.launch.py merges extrinsics + sbg serial into the driver param overlay.
 #
 # TODO(septentrio): Septentrio launches still use config/usv.yaml directly — unify later.
-
+#
+# Offsets apply to the catamaran hull w/ SBG mounted on plate
 vehicle:
   name: floatsam0
 
@@ -23,11 +24,12 @@ extrinsics:
     rpy: [0.0, 0.0, 0.0]
   gnss:
     child_frame: gnss
-    xyz: [0.0, 1.0, 0.0]   # primary antenna, 1 m port of IMU
+    # xyz: [0.0, 1.0, 0.0]   # primary antenna, 1 m port of IMU
+    xyz: [-0.38, 0.305, 0.1]
     rpy: [0.0, 0.0, 0.0]
   aux1:
     child_frame: aux1
-    xyz: [0.0, -1.0, 0.0]  # secondary antenna, 1 m starboard of IMU
+    xyz: [-0.38, -0.095, 0.1]  # secondary antenna, 1 m starboard of IMU
     rpy: [0.0, 0.0, 0.0]
   vsm:
     child_frame: vsm
