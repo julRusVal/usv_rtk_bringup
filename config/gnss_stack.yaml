@@ -10,7 +10,7 @@ primary:
   septentrio:
     profile: rtk       # gnss | rtk | rtk_heading
   sbg:
-    params_file: config/sbg_floatsam0.yaml   # vehicle config (confWithRos: true)
+    params_file: config/sbg_floatsam_usv_0.yaml   # vehicle config (confWithRos: true)
     # params_file: config/sbg_ellipse_d.yaml  # default: use SBG Center flash only
   ublox:
     params_file: config/ublox.yaml

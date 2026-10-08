@@ -41,7 +41,7 @@ def _xyz_tuple(frame):
 def flu_xyz_to_sbg_frd(x, y, z):
     """Convert ROS FLU offsets (imu/base_link) to SBG IMU FRD lever arms.
 
-    SBG Ellipse alignment in sbg_floatsam0.yaml uses axisDirectionX=FORWARD,
+    SBG Ellipse alignment in sbg_floatsam_usv_0.yaml uses axisDirectionX=FORWARD,
     axisDirectionY=RIGHT (FRD). Vehicle extrinsics are stored in ROS FLU.
     """
     return float(x), float(-y), float(-z)

@@ -7,7 +7,7 @@ Disconnects when the fix is lost or stale.
 Typical use (SBG / u-blox with ROS corrections path):
 
   ros2 run usv_rtk_bringup ntrip_ros_client \\
-    --nmea-topic /nmea --rtcm-topic /floatsam0/rtcm
+    --nmea-topic /nmea --rtcm-topic /floatsam_usv_0/rtcm
 
 Requires: pygnssutils (pynmeagps), rclpy, nmea_msgs, rtcm_msgs.
 """

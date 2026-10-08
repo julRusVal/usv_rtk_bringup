@@ -91,7 +91,7 @@ def resolve_gnss_stack(
     # Septentrio / NTRIP aux serial still use config/usv.yaml (see TODO in gnss_stack.yaml).
     ntrip_vehicle_config = default_vehicle_config_path()
     sbg_vehicle_config = _resolve_config_path(
-        vehicle_config_override or stack.get('vehicle_config', 'config/vehicles/floatsam0.yaml'),
+        vehicle_config_override or stack.get('vehicle_config', 'config/vehicles/floatsam_usv_0.yaml'),
         pkg_share,
     )
 

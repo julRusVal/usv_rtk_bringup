@@ -65,8 +65,8 @@ ros2 run usv_rtk_bringup gnss_link_monitor
 
 Discovers **all** publishers on the graph:
 
-- every `sensor_msgs/NavSatFix` topic (e.g. `/floatsam0/septentrio/navsatfix`, `/floatsam0/sbg/imu/nav_sat_fix`)
-- every `rtcm_msgs/Message` topic (e.g. `/floatsam0/rtcm`)
+- every `sensor_msgs/NavSatFix` topic (e.g. `/floatsam_usv_0/septentrio/navsatfix`, `/floatsam_usv_0/sbg/imu/nav_sat_fix`)
+- every `rtcm_msgs/Message` topic (e.g. `/floatsam_usv_0/rtcm`)
 - every `septentrio_gnss_driver/AttEuler` topic (heading merged into the matching namespace)
 
 New publishers appearing after the monitor starts are picked up on the next scan (~3 s). The monitor can start before the driver or NTRIP client.
@@ -79,7 +79,7 @@ ros2 launch usv_rtk_bringup rtk.launch.py
 
 # terminal 2
 ros2 run usv_rtk_bringup ntrip_aux_client --release-port --publish-rtcm \
-  --rtcm-topic /floatsam0/rtcm
+  --rtcm-topic /floatsam_usv_0/rtcm
 
 # terminal 3 (can start first)
 ros2 run usv_rtk_bringup gnss_link_monitor
@@ -100,7 +100,7 @@ With `sbg.launch.py` running:
 ```bash
 ros2 run usv_rtk_bringup gnss_link_monitor
 # or explicitly:
-ros2 run usv_rtk_bringup gnss_link_monitor --topic /floatsam0/sbg/imu/nav_sat_fix
+ros2 run usv_rtk_bringup gnss_link_monitor --topic /floatsam_usv_0/sbg/imu/nav_sat_fix
 ```
 
 The monitor auto-subscribes to `sbg/gps_pos` and `sbg/gps_hdt` in the same namespace. **Fix** uses SBG position type (RTK Fixed/Float, DGPS, …) and **Heading** uses dual-antenna `gps_hdt` (true heading, pitch, baseline).
@@ -109,7 +109,7 @@ Healthy SBG + NTRIP:
 
 - **Fix:** `RTK Fixed` with `(corr …s)` from `diff_age`
 - **Quality:** `SVs` > 0, σE/N in cm range with RTK
-- **RTCM:** active on `/floatsam0/rtcm`
+- **RTCM:** active on `/floatsam_usv_0/rtcm`
 - **Heading:** `h …°` with valid baseline when dual-antenna is configured
 
 ### Dual-antenna heading
@@ -121,10 +121,10 @@ ros2 launch usv_rtk_bringup all_gnss.launch.py profile:=rtk_heading
 ros2 run usv_rtk_bringup gnss_link_monitor
 ```
 
-When `atteuler` is published under `/floatsam0/septentrio/`, the Septentrio block gains a **Heading** line:
+When `atteuler` is published under `/floatsam_usv_0/septentrio/`, the Septentrio block gains a **Heading** line:
 
 ```
-[floatsam0/septentrio]  /floatsam0/septentrio/navsatfix
+[floatsam0/septentrio]  /floatsam_usv_0/septentrio/navsatfix
   ...
   Heading:  h 127.45°  pitch 1.20°  roll -0.30°  SVs 12  σ_h 0.15°  mode 4
 ```
@@ -136,8 +136,8 @@ Values are raw receiver-frame angles from `AttEuler` (not remapped body-frame `h
 ```bash
 ros2 run usv_rtk_bringup gnss_link_monitor \
   --no-discover \
-  --topic /floatsam0/septentrio/navsatfix \
-  --rtcm-topic /floatsam0/rtcm
+  --topic /floatsam_usv_0/septentrio/navsatfix \
+  --rtcm-topic /floatsam_usv_0/rtcm
 ```
 
 Repeat `--topic` or `--rtcm-topic` for multiple streams.
@@ -216,7 +216,7 @@ GNSS link monitor
 uptime 42s · refresh 2.0 Hz · GNSS 2 · RTCM 1
 
 GNSS sensors
-[floatsam0/septentrio]  /floatsam0/septentrio/navsatfix
+[floatsam0/septentrio]  /floatsam_usv_0/septentrio/navsatfix
   Fix:      RTK Fixed (corr 1.2s)
   Position: lat  59.1234567  lon  18.1234567  alt    12.34 m
   Cov ENU:  σE 0.012 m   σN 0.011 m   σU 0.024 m   (known)
@@ -224,12 +224,12 @@ GNSS sensors
   Heading:  h 127.45°  pitch 1.20°  roll -0.30°  SVs 12  σ_h 0.15°  mode 4
   Updated:  120 ms ago
 
-[floatsam0/ublox]  /floatsam0/ublox/fix
+[floatsam0/ublox]  /floatsam_usv_0/ublox/fix
   Fix:      Fix
   ...
 
 RTCM streams
-[floatsam0/rtcm]  /floatsam0/rtcm
+[floatsam0/rtcm]  /floatsam_usv_0/rtcm
   Rate:     1.05 Hz  (1520 B/s)  active
   Last:     GPS MSM7  342 B  (890 ms ago)
   Recent:   GPS MSM7×5, Galileo MSM7×4

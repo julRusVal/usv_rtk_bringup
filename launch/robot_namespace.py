@@ -57,7 +57,7 @@ def default_nmea_topic(robot_name, explicit=''):
 
 
 def robot_topic_namespace(robot_name):
-    """Prefix for sbg_driver rtcm/nmea.namespace params (e.g. /floatsam0)."""
+    """Prefix for sbg_driver rtcm/nmea.namespace params (e.g. /floatsam_usv_0)."""
     robot = normalize_name_part(robot_name)
     return f'/{robot}' if robot else ''
 
@@ -66,7 +66,7 @@ def declare_robot_name_argument():
     return DeclareLaunchArgument(
         'robot_name',
         default_value=EnvironmentVariable('ROBOT_NAME', default_value=''),
-        description='Top-level robot namespace (e.g. floatsam0). '
+        description='Top-level robot namespace (e.g. floatsam_usv_0). '
         'GNSS topics are under {robot_name}/{ublox|septentrio|sbg}/. '
         'Set ROBOT_NAME in usv-host-setup/config/usv-robot.env.sh.',
     )

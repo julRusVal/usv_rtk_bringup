@@ -8,8 +8,8 @@ Standalone entry point — same overlay as all_gnss module:=sbg, without the swi
 
 Direct sbg_driver (no launch file) — bake params first:
 
-  ros2 run usv_rtk_bringup merge_sbg_params --robot-name floatsam0 -o /tmp/sbg.yaml
-  ros2 run sbg_driver sbg_device --ros-args -r __ns:=/floatsam0/sbg --params-file /tmp/sbg.yaml
+  ros2 run usv_rtk_bringup merge_sbg_params --robot-name floatsam_usv_0 -o /tmp/sbg.yaml
+  ros2 run sbg_driver sbg_device --ros-args -r __ns:=/floatsam_usv_0/sbg --params-file /tmp/sbg.yaml
 """
 import os
 import sys

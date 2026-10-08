@@ -33,7 +33,7 @@ ros2 launch usv_rtk_bringup sbg.launch.py enable_ntrip:=true
 ros2 run usv_rtk_bringup gnss_link_monitor
 ```
 
-Config: `config/gnss_stack.yaml` → `config/vehicles/floatsam0.yaml` + `config/sbg_floatsam0.yaml`. Namespace `/floatsam0/sbg`; NMEA/RTCM at `/floatsam0/nmea` and `/floatsam0/rtcm`.
+Config: `config/gnss_stack.yaml` → `config/vehicles/floatsam_usv_0.yaml` + `config/sbg_floatsam_usv_0.yaml`. Namespace `/floatsam_usv_0/sbg`; NMEA/RTCM at `/floatsam_usv_0/nmea` and `/floatsam_usv_0/rtcm`.
 
 ## Building
 
@@ -92,7 +92,7 @@ Set `ROBOT_NAME` once per vehicle (see [Robot namespace](#robot-namespace)). Sou
 
 ```bash
 ros2 run usv_rtk_bringup ntrip_aux_client --release-port --publish-rtcm \
-  --rtcm-topic /floatsam0/rtcm
+  --rtcm-topic /floatsam_usv_0/rtcm
 ```
 
 Or launch individual drivers directly: `rtk.launch.py`, `gnss.launch.py`, `ublox.launch.py`, `rtk_heading.launch.py`.
@@ -105,21 +105,21 @@ Or launch individual drivers directly: `rtk.launch.py`, `gnss.launch.py`, `ublox
 | `robot_name` (launch) | `$ROBOT_NAME` | Override per launch: `robot_name:=floatsam1` |
 | `namespace` (launch) | _(empty)_ | Full override; default is `{robot_name}/{sensor}` |
 
-With `ROBOT_NAME=floatsam0`:
+With `ROBOT_NAME=floatsam_usv_0`:
 
 | Driver | Namespace | Example topic |
 |---|---|---|
-| u-blox | `/floatsam0/ublox` | `.../fix` |
-| Septentrio | `/floatsam0/septentrio` | `.../navsatfix`, `.../pvtgeodetic` |
-| RTCM (shared) | `/floatsam0/rtcm` | u-blox subscribes here by default |
+| u-blox | `/floatsam_usv_0/ublox` | `.../fix` |
+| Septentrio | `/floatsam_usv_0/septentrio` | `.../navsatfix`, `.../pvtgeodetic` |
+| RTCM (shared) | `/floatsam_usv_0/rtcm` | u-blox subscribes here by default |
 
-Dual-antenna heading (`rtk_heading.launch.py`) publishes `heading`, `yaw`, `pitch`, `roll`, `imu` under `/floatsam0/septentrio/`.
+Dual-antenna heading (`rtk_heading.launch.py`) publishes `heading`, `yaw`, `pitch`, `roll`, `imu` under `/floatsam_usv_0/septentrio/`.
 
 Per-vehicle setup on the Pi:
 
 ```bash
 # edit once per hull
-nano ~/usv-host-setup/config/usv-robot.env.sh   # export ROBOT_NAME=floatsam0
+nano ~/usv-host-setup/config/usv-robot.env.sh   # export ROBOT_NAME=floatsam_usv_0
 source ~/usv-host-setup/config/ros-zenoh.env.sh
 ```
 
@@ -146,11 +146,11 @@ Requires a second antenna on **AUX1**. Lever arms come from `extrinsics.gnss` an
 
 | Topic | Type | Units | Meaning |
 |-------|------|-------|---------|
-| `/floatsam0/septentrio/heading` | `std_msgs/Float64` | degrees | Compass heading (0° = North, CW) |
-| `/floatsam0/septentrio/yaw` | `std_msgs/Float64` | radians | ENU yaw (0 = East, CCW) |
-| `/floatsam0/septentrio/pitch` | `std_msgs/Float64` | radians | Body pitch |
-| `/floatsam0/septentrio/roll` | `std_msgs/Float64` | radians | Body roll |
-| `/floatsam0/septentrio/imu` | `sensor_msgs/Imu` | quaternion + cov | Body orientation for `robot_localization` |
+| `/floatsam_usv_0/septentrio/heading` | `std_msgs/Float64` | degrees | Compass heading (0° = North, CW) |
+| `/floatsam_usv_0/septentrio/yaw` | `std_msgs/Float64` | radians | ENU yaw (0 = East, CCW) |
+| `/floatsam_usv_0/septentrio/pitch` | `std_msgs/Float64` | radians | Body pitch |
+| `/floatsam_usv_0/septentrio/roll` | `std_msgs/Float64` | radians | Body roll |
+| `/floatsam_usv_0/septentrio/imu` | `sensor_msgs/Imu` | quaternion + cov | Body orientation for `robot_localization` |
 
 #### Why a remap node?
 
@@ -194,10 +194,10 @@ Heading conversion (ROS driver output):
 Covariance from `/attcoveuler` follows the same pitch↔roll swap on beam mounts. Messages are published only when `atteuler.error == 0` and `atteuler.mode >= 1`.
 
 ```bash
-ros2 topic echo /floatsam0/septentrio/heading --once   # compass deg
-ros2 topic echo /floatsam0/septentrio/yaw --once       # ENU rad (~1.57 when bow north)
-ros2 topic echo /floatsam0/septentrio/roll --once      # beam mount: from receiver pitch
-ros2 topic echo /floatsam0/septentrio/imu --once       # orientation + covariance
+ros2 topic echo /floatsam_usv_0/septentrio/heading --once   # compass deg
+ros2 topic echo /floatsam_usv_0/septentrio/yaw --once       # ENU rad (~1.57 when bow north)
+ros2 topic echo /floatsam_usv_0/septentrio/roll --once      # beam mount: from receiver pitch
+ros2 topic echo /floatsam_usv_0/septentrio/imu --once       # orientation + covariance
 ros2 run tf2_ros tf2_echo gnss aux1              # [0, -2, 0] → beam detected
 ```
 
@@ -331,7 +331,7 @@ ros2 launch usv_rtk_bringup rtk.launch.py receiver_ip:=192.168.3.1
 | File | Purpose |
 |---|---|
 | `config/usv.yaml` | Septentrio receiver connection, extrinsics (legacy single file) |
-| `config/vehicles/floatsam0.yaml` | Per-hull extrinsics + SBG serial (merged at launch for `module:=sbg`) |
+| `config/vehicles/floatsam_usv_0.yaml` | Per-hull extrinsics + SBG serial (merged at launch for `module:=sbg`) |
 | `config/gnss_stack.yaml` | Module selector; `vehicle_config` points at per-hull YAML for SBG |
 | `config/gnss.yaml` | GNSS-only driver parameters (phase 1, no RTK) |
 | `config/gnss_aux_nmea.cmd` | Custom commands: GGA/RMC on USB2 for str2str (override via `aux_nmea_cmd_file`; default commands are generated from `aux_receiver_port`) |
@@ -349,7 +349,7 @@ cp config/secrets.yaml.example config/secrets.yaml
 
 `secrets.yaml` is **not** loaded by `rtk.launch.py`. The driver receives RTCM on receiver port **USB2** (`/dev/usv-rtk-aux` on the host) while `ntrip_aux_client` streams corrections there.
 
-Edit `config/usv.yaml` for Septentrio serial paths and extrinsics. For SBG, edit `config/vehicles/floatsam0.yaml` (geometry) and `config/sbg_floatsam0.yaml` (sensor tuning). Edit `config/rtk.yaml` for publish flags and receiver options.
+Edit `config/usv.yaml` for Septentrio serial paths and extrinsics. For SBG, edit `config/vehicles/floatsam_usv_0.yaml` (geometry) and `config/sbg_floatsam_usv_0.yaml` (sensor tuning). Edit `config/rtk.yaml` for publish flags and receiver options.
 
 > **TODO:** Septentrio launches still read `config/usv.yaml` only — per-hull `config/vehicles/*.yaml` is wired for SBG first; Septentrio vehicle merge is a little behind.
 
@@ -386,13 +386,13 @@ ros2 run usv_rtk_bringup check_serial --skip-main-query
 Quick check while `rtk.launch.py` and `ntrip_aux_client` are running:
 
 ```bash
-ros2 topic echo /floatsam0/septentrio/pvtgeodetic --field mode --field mean_corr_age
+ros2 topic echo /floatsam_usv_0/septentrio/pvtgeodetic --field mode --field mean_corr_age
 # mean_corr_age > 0 and mode 2/3/4 ⇒ corrections active
 ```
 
 ```bash
-ros2 topic echo /floatsam0/septentrio/navsatfix
-ros2 topic echo /floatsam0/septentrio/pvtgeodetic
+ros2 topic echo /floatsam_usv_0/septentrio/navsatfix
+ros2 topic echo /floatsam_usv_0/septentrio/pvtgeodetic
 ```
 
 **Live GNSS dashboard** — see **[docs/gnss_link_monitor.md](docs/gnss_link_monitor.md)** (fix type, coords, ENU covariance, dual-antenna heading, RTCM rate/Hz).

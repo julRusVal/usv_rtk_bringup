@@ -48,8 +48,8 @@ Published RTCM #1 (1074, … bytes) on /rtcm
 
 ```bash
 ros2 run usv_rtk_bringup ntrip_aux_client --release-port --publish-rtcm \
-  --rtcm-topic /floatsam0/rtcm
-ros2 topic hz /floatsam0/rtcm
+  --rtcm-topic /floatsam_usv_0/rtcm
+ros2 topic hz /floatsam_usv_0/rtcm
 ```
 
 Expect a steady rate (mountpoint-dependent, often ~1 Hz for MSM streams). Or use [`gnss_link_monitor`](gnss_link_monitor.md) for rate, message types, and GNSS fix quality in one view.
@@ -163,7 +163,7 @@ If metrics toggle with NTRIP on/off, the receiver **is** receiving and using cor
 # 1. Stack running
 ros2 launch usv_rtk_bringup rtk.launch.py
 ros2 run usv_rtk_bringup ntrip_aux_client --release-port --publish-rtcm \
-  --rtcm-topic /floatsam0/rtcm
+  --rtcm-topic /floatsam_usv_0/rtcm
 
 # 2. NTRIP connected (terminal 2 logs)
 
@@ -171,8 +171,8 @@ ros2 run usv_rtk_bringup ntrip_aux_client --release-port --publish-rtcm \
 ros2 run usv_rtk_bringup gnss_link_monitor
 
 # 4. Or spot-check individual topics
-ros2 topic echo /floatsam0/septentrio/pvtgeodetic --field mean_corr_age --field mode
-ros2 topic echo /floatsam0/septentrio/gpgga --field gps_qual
+ros2 topic echo /floatsam_usv_0/septentrio/pvtgeodetic --field mean_corr_age --field mode
+ros2 topic echo /floatsam_usv_0/septentrio/gpgga --field gps_qual
 ```
 
 See [gnss_link_monitor.md](gnss_link_monitor.md) for options (`--discover`, `--no-rtcm`, dual-antenna heading).

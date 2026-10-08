@@ -1,6 +1,6 @@
 /**:
   ros__parameters:
-    # floatsam0 — SBG Ellipse-D (editable vehicle config)
+    # floatsam_usv_0 — SBG Ellipse-D (editable vehicle config)
     #
     # Based on:
     #   config/sbg_ellipse_d.yaml          — package default (confWithRos: false)
@@ -12,14 +12,14 @@
     #   regardless of confWithRos.
     #
     # Serial port/baud, lever arms, frame IDs: overridden at launch from
-    # config/vehicles/floatsam0.yaml (see gnss_stack.yaml → vehicle_config).
+    # config/vehicles/floatsam_usv_0.yaml (see gnss_stack.yaml → vehicle_config).
     # Select this file in config/gnss_stack.yaml → primary.sbg.params_file
     #
     # First-time workflow:
     #   1. Edit sections below (motion profile, lever arms, output rates).
     #   2. colcon build --packages-select usv_rtk_bringup && source install/setup.bash
     #   3. ros2 launch usv_rtk_bringup all_gnss.launch.py module:=sbg log_level:=DEBUG
-    #   4. Confirm logs: productCode, "configuration", then /nmea + /floatsam0/sbg/*
+    #   4. Confirm logs: productCode, "configuration", then /nmea + /floatsam_usv_0/sbg/*
     #   5. Save to device flash in SBG Center if you want YAML + Center in sync.
     #
     # Aug 2025 backup notes: magnetometer off; dual-antenna ~1 m baseline on X; RTK type 6.
@@ -45,7 +45,7 @@
     # Push Ellipse sensor config from this YAML on each driver start.
     confWithRos: true
 
-    # Serial port/baud are set at launch from config/vehicles/floatsam0.yaml.
+    # Serial port/baud are set at launch from config/vehicles/floatsam_usv_0.yaml.
     uartConf:
       portName: "/dev/usv-sbg"
       baudRate: 921600

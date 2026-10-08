@@ -3,14 +3,14 @@
 
 Use when launching sbg_driver directly (without usv_rtk_bringup launch files):
 
-  ros2 run usv_rtk_bringup merge_sbg_params --robot-name floatsam0 -o /tmp/sbg_merged.yaml
+  ros2 run usv_rtk_bringup merge_sbg_params --robot-name floatsam_usv_0 -o /tmp/sbg_merged.yaml
   ros2 run sbg_driver sbg_device --ros-args \\
-    -r __ns:=/floatsam0/sbg \\
+    -r __ns:=/floatsam_usv_0/sbg \\
     --params-file /tmp/sbg_merged.yaml
 
 Or print merged YAML to stdout:
 
-  ros2 run usv_rtk_bringup merge_sbg_params --robot-name floatsam0
+  ros2 run usv_rtk_bringup merge_sbg_params --robot-name floatsam_usv_0
 """
 
 from __future__ import annotations

@@ -993,10 +993,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         epilog=(
             'Examples:\n'
             '  ros2 run usv_rtk_bringup gnss_link_monitor\n'
-            '  ros2 run usv_rtk_bringup gnss_link_monitor --topic /floatsam0/septentrio/navsatfix\n'
-            '  ros2 run usv_rtk_bringup gnss_link_monitor --topic /floatsam0/sbg/imu/nav_sat_fix\n'
+            '  ros2 run usv_rtk_bringup gnss_link_monitor --topic /floatsam_usv_0/septentrio/navsatfix\n'
+            '  ros2 run usv_rtk_bringup gnss_link_monitor --topic /floatsam_usv_0/sbg/imu/nav_sat_fix\n'
             '  ros2 run usv_rtk_bringup gnss_link_monitor --discover\n'
-            '  ros2 run usv_rtk_bringup gnss_link_monitor --rtcm-topic /floatsam0/rtcm\n'
+            '  ros2 run usv_rtk_bringup gnss_link_monitor --rtcm-topic /floatsam_usv_0/rtcm\n'
         ),
     )
     parser.add_argument(
