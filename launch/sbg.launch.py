@@ -13,6 +13,9 @@ Direct sbg_driver (no launch file) — bake params first:
 """
 import os
 import sys
+import tempfile
+
+import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -78,6 +81,14 @@ def launch_setup(context, *args, **kwargs):
         rtcm_topic=launch_arg(context, 'rtcm_topic'),
         nmea_topic=launch_arg(context, 'nmea_topic'),
     )
+    # sbg_device reads its params through an internal helper node ("npv") and also creates a
+    # "tf_broadcaster" node, so the overlay must reach every node in the process: write it under
+    # /** (a dict in `parameters` would be scoped to the main node's name only). This lets us skip
+    # name= on the Node — that remaps *all* nodes in the process to the same name (duplicate
+    # /<ns>/sbg/sbg_device in `ros2 node list`).
+    with tempfile.NamedTemporaryFile('w', prefix='sbg_overlay_', suffix='.yaml', delete=False) as f:
+        yaml.safe_dump({'/**': {'ros__parameters': param_overlay}}, f)
+        overlay_file = f.name
 
     nmea_topic = default_nmea_topic(robot_name, launch_arg(context, 'nmea_topic'))
     rtcm_topic = default_rtcm_topic(robot_name, launch_arg(context, 'rtcm_topic'))
@@ -90,10 +101,9 @@ def launch_setup(context, *args, **kwargs):
         Node(
             package='sbg_driver',
             executable='sbg_device',
-            name='sbg_device',
             namespace=namespace,
             output='screen',
-            parameters=[params_file, param_overlay],
+            parameters=[params_file, overlay_file],
             arguments=['--ros-args', '--log-level', log_level],
         ),
         *static_transform_nodes(resolved['extrinsics']),
