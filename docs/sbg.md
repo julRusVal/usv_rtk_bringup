@@ -171,7 +171,7 @@ With `ROBOT_NAME=floatsam_usv_0`:
 | `/floatsam_usv_0/nmea` | `nmea_msgs/Sentence` | GGA for NTRIP |
 | `/floatsam_usv_0/rtcm` | `rtcm_msgs/Message` | RTCM corrections |
 
-Static TF from vehicle extrinsics, prefixed with the robot name: `<robot>/base_link` → `<robot>/imu` → `<robot>/gnss` / `<robot>/aux1` / `<robot>/vsm`.
+Static TF from vehicle extrinsics, prefixed with the robot name: `<robot>/base_link` → `<robot>/imu` → `<robot>/gnss` / `<robot>/aux1` / `<robot>/vsm` — published by the robot description (`usv_bringup` `description.launch.py`, built from the same vehicle YAML). `sbg.launch.py publish_static_tf:=true` publishes them here instead (only when running without the description).
 
 The SBG's own INS solution is published as a **reference branch**, not the main pose (robot_localization owns `map → <robot>/odom → <robot>/base_link`): `utm → <robot>/sbg_odom` (static, UTM of the SBG's first fix) and `<robot>/sbg_odom → <robot>/sbg_base_link` (dynamic). The driver only sends these in full navigation mode (`NAV_POSITION`). Compare with `ros2 run tf2_ros tf2_echo <robot>/base_link <robot>/sbg_base_link`. Plan: usv-host-setup `docs/usv-bringup-roadmap.md` WS4.
 

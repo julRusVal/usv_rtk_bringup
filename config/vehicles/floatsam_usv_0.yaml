@@ -35,3 +35,32 @@ extrinsics:
     child_frame: vsm
     xyz: [0.0, 0.0, 0.0]
     rpy: [0.0, 0.0, 0.0]
+
+  # Below: used only by the robot description (usv_bringup description.launch.py -> robot_state_publisher).
+  # parent: base_link unless stated. NOT MEASURED yet — placeholders, replace with tape-measured values.
+  thruster_port:
+    parent: base_link
+    child_frame: thruster_port
+    xyz: [-0.09, 0.25, -0.15]   # placeholder (smarc2 floatsam_description, commented out); track 0.50 m = PX4 RD_WHEEL_TRACK
+    rpy: [0.0, 0.0, 0.0]
+  thruster_strb:
+    parent: base_link
+    child_frame: thruster_strb
+    xyz: [-0.09, -0.25, -0.15]  # placeholder (as above)
+    rpy: [0.0, 0.0, 0.0]
+  modem:
+    parent: base_link
+    child_frame: modem_link     # name used by smarc2 consumers
+    xyz: [0.27, 0.0, -0.20]     # placeholder (constant in smarc_topics_publisher.py)
+    rpy: [0.0, 0.0, 0.0]
+  sonar:
+    parent: base_link
+    child_frame: sonar_link     # name used by smarc2 consumers
+    xyz: [0.32, 0.0, -0.20]     # placeholder (constant in smarc_topics_publisher.py)
+    rpy: [0.0, 0.0, 0.0]
+
+# Hull mesh (usv_bringup/mesh/floatsam_usv.dae) relative to base_link (= SBG IMU) — visual only, approximate
+# (smarc2 used -0.3 0 -0.1 relative to its own base_link). Check in RViz.
+hull_visual:
+  xyz: [-0.3, 0.0, -0.1]
+  rpy: [0.0, 0.0, 0.0]

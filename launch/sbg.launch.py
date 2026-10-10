@@ -117,7 +117,8 @@ def launch_setup(context, *args, **kwargs):
             parameters=[params_file, overlay_file],
             arguments=['--ros-args', '--log-level', log_level],
         ),
-        *static_transform_nodes(resolved['extrinsics']),
+        *(static_transform_nodes(resolved['extrinsics'])
+          if launch_arg(context, 'publish_static_tf').lower() == 'true' else []),
         *settings_actions,
     ]
 
@@ -164,6 +165,12 @@ def generate_launch_description():
     return LaunchDescription([
         declare_robot_name_argument(),
         declare_namespace_override_argument(SENSOR_SBG),
+        DeclareLaunchArgument(
+            'publish_static_tf',
+            default_value='false',
+            description='Publish base_link -> imu -> gnss/aux1/vsm here. Default false: usv_bringup '
+                        'description.launch.py (robot_state_publisher) owns these links; true only without it',
+        ),
         DeclareLaunchArgument(
             'record_device_settings',
             default_value='true',
