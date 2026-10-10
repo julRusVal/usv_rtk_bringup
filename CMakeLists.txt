@@ -20,6 +20,7 @@ install(PROGRAMS
   utilities/merge_sbg_params
   utilities/dual_antenna_attitude_remap
   utilities/sbg_settings
+  utilities/sbg_settings_publisher
   DESTINATION lib/${PROJECT_NAME}
 )
 

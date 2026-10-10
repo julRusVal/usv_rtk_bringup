@@ -291,3 +291,20 @@ ours 107) can't be written by the driver on this firmware ("not available") and 
 `primaryLeverPrecise: true`, `rtcmPortAssignment: 0` (port A), `gnss_model_id: 101` (INTERNAL). `sbg_settings` → 0 of 64
 differ; a driver start no longer logs "lever arm updated" / "settings saved and device rebooted" (or "not available"),
 so the SBG keeps its alignment and RTK state across driver restarts.
+
+## Device settings in every bag
+
+`sbg.launch.py` runs `sbg_settings --json` before starting the driver (≈3 s; the port is still free) and saves the
+snapshot to `~/.ros/sbg_device_settings/<robot>-<time>.json`. `sbg_settings_publisher` then publishes it on
+**`/<robot>/sbg/device_settings`** (`std_msgs/String`, JSON, transient-local, re-sent every 30 s): device info, every
+stored setting, our configuration, the comparison and the git commit of our config (or an `"error"` if the read failed).
+A bag that records this topic contains it even if recording starts late (verified 2026-10-10: recording started 22 s
+after launch had the message). Read it back:
+
+```bash
+ros2 topic echo --once --qos-durability transient_local /floatsam_usv_0/sbg/device_settings
+```
+
+`record_device_settings:=false` skips it. If an old `sbg_device` still holds the port (it takes a few seconds to exit),
+the snapshot records that error and the driver starts as usual.
+

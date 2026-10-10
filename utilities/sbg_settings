@@ -230,7 +230,22 @@ def load_ours(robot_name: str) -> tuple[dict, dict]:
         return p
     sbg_params, vehicle = resolve(stack['sbg_params_file']), resolve(stack['sbg_vehicle_config'])
     merged = merge_sbg_driver_params(sbg_params, vehicle, robot_name)['/**']['ros__parameters']
-    return merged, {'sbg_params': sbg_params, 'vehicle_config': vehicle, 'robot_name': robot_name}
+    return merged, {'sbg_params': sbg_params, 'vehicle_config': vehicle, 'robot_name': robot_name,
+                    'git': git_state(sbg_params)}
+
+
+def git_state(path: str) -> str:
+    """'<commit>[-dirty]' of the repo holding the (symlink-installed) config file, or ''."""
+    import subprocess
+    src = os.path.dirname(os.path.realpath(path))
+    try:
+        head = subprocess.run(['git', '-C', src, 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True,
+                              timeout=5).stdout.strip()
+        dirty = subprocess.run(['git', '-C', src, 'status', '--porcelain'], capture_output=True, text=True,
+                               timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ''
+    return f'{head}-dirty' if head and dirty else head
 
 
 def ours_expected(p: dict) -> dict:
@@ -323,35 +338,50 @@ def main():
     ap.add_argument('--baud', type=int, help='baud rate (default: uartConf.baudRate from our config)')
     ap.add_argument('--robot-name', default=os.environ.get('ROBOT_NAME', ''))
     ap.add_argument('--json', action='store_true', help='print JSON (device, ours, comparison) instead of the table')
+    ap.add_argument('--output', metavar='FILE', help='with --json: write to FILE (also written on failure, with "error")')
     ap.add_argument('--all', action='store_true', help='table: also list matching settings (default: mismatches + key items)')
     args = ap.parse_args()
 
     params, sources = load_ours(args.robot_name)
     port = args.port or params.get('uartConf', {}).get('portName', '/dev/usv-sbg')
-    users = port_users(port)
-    if users:
-        sys.exit(f'{port} is open by {", ".join(users)} (sbg_driver?) — stop it first.')
     baud = args.baud or int(params.get('uartConf', {}).get('baudRate', 921600))
     port_id = int(params.get('uartConf', {}).get('portID', 0))
+    stamp = datetime.datetime.now().astimezone().isoformat(timespec='seconds')
 
-    link = SbgLink(port, baud)
+    def fail(msg):
+        if args.json and args.output:
+            Path(args.output).write_text(json.dumps({'stamp': stamp, 'port': port, 'baud': baud, 'sources': sources,
+                                                     'error': msg}, indent=1, default=str))
+        sys.exit(msg)
+
+    users = port_users(port)
+    if users:
+        fail(f'{port} is open by {", ".join(users)} (sbg_driver?) — stop it first.')
+    try:
+        link = SbgLink(port, baud)
+    except serial.SerialException as e:
+        fail(f'cannot open {port}: {e}')
     try:
         device = read_device(link, port_id)
     finally:
         link.ser.close()
     if 'error' in device.get('info', {}):
-        sys.exit(f'No answer from the SBG on {port} @ {baud} ({device["info"]["error"]}).')
+        fail(f'No answer from the SBG on {port} @ {baud} ({device["info"]["error"]}).')
 
     expected = ours_expected(params)
     rows = compare({k: v for k, v in device.items() if k not in ('info', 'extraBytes')}, expected)
-    stamp = datetime.datetime.now().astimezone().isoformat(timespec='seconds')
     mismatches = [r for r in rows if r[3] in ('DIFF', '~float')]
 
     if args.json:
-        print(json.dumps({'stamp': stamp, 'port': port, 'baud': baud, 'sources': sources, 'device': device,
-                          'ours': expected,
-                          'comparison': [dict(zip(('setting', 'device', 'ours', 'verdict'), r)) for r in rows],
-                          'mismatches': [r[0] for r in mismatches]}, indent=1, default=str))
+        text = json.dumps({'stamp': stamp, 'port': port, 'baud': baud, 'sources': sources, 'device': device,
+                           'ours': expected,
+                           'comparison': [dict(zip(('setting', 'device', 'ours', 'verdict'), r)) for r in rows],
+                           'mismatches': [r[0] for r in mismatches]}, indent=1, default=str)
+        if args.output:
+            Path(args.output).write_text(text)
+            print(f'{len(mismatches)} of {len(rows)} settings differ; written to {args.output}')
+        else:
+            print(text)
         return
 
     i = device['info']

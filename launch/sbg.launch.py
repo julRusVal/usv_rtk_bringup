@@ -6,12 +6,19 @@ Standalone entry point — same overlay as all_gnss module:=sbg, without the swi
   ros2 launch usv_rtk_bringup sbg.launch.py
   ros2 launch usv_rtk_bringup sbg.launch.py enable_ntrip:=true
 
+Before sbg_driver starts (and takes the serial port), the device's stored settings are read with
+sbg_settings and saved to ~/.ros/sbg_device_settings/<robot>-<time>.json; sbg_settings_publisher then
+publishes them latched on /<robot>/sbg/device_settings so bags carry them (record_device_settings:=false
+to skip).
+
 Direct sbg_driver (no launch file) — bake params first:
 
   ros2 run usv_rtk_bringup merge_sbg_params --robot-name floatsam_usv_0 -o /tmp/sbg.yaml
   ros2 run sbg_driver sbg_device --ros-args -r __ns:=/floatsam_usv_0/sbg --params-file /tmp/sbg.yaml
 """
+import datetime
 import os
+import subprocess
 import sys
 import tempfile
 
@@ -19,7 +26,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, LogInfo, OpaqueFunction
 from launch_ros.actions import Node
@@ -90,6 +97,10 @@ def launch_setup(context, *args, **kwargs):
         yaml.safe_dump({'/**': {'ros__parameters': param_overlay}}, f)
         overlay_file = f.name
 
+    settings_actions = []
+    if launch_arg(context, 'record_device_settings').lower() == 'true':
+        settings_actions = record_device_settings(robot_name, namespace)
+
     nmea_topic = default_nmea_topic(robot_name, launch_arg(context, 'nmea_topic'))
     rtcm_topic = default_rtcm_topic(robot_name, launch_arg(context, 'rtcm_topic'))
 
@@ -107,6 +118,7 @@ def launch_setup(context, *args, **kwargs):
             arguments=['--ros-args', '--log-level', log_level],
         ),
         *static_transform_nodes(resolved['extrinsics']),
+        *settings_actions,
     ]
 
     if stack['enable_ntrip']:
@@ -122,10 +134,41 @@ def launch_setup(context, *args, **kwargs):
     return actions
 
 
+def record_device_settings(robot_name, namespace):
+    """Read the SBG's stored settings now (port still free) and publish the snapshot for bags."""
+    snapshot_dir = os.path.expanduser('~/.ros/sbg_device_settings')
+    os.makedirs(snapshot_dir, exist_ok=True)
+    stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+    path = os.path.join(snapshot_dir, f'{robot_name or "sbg"}-{stamp}.json')
+    tool = os.path.join(get_package_prefix('usv_rtk_bringup'), 'lib', 'usv_rtk_bringup', 'sbg_settings')
+    try:
+        result = subprocess.run([tool, '--json', '--output', path, '--robot-name', robot_name],
+                                capture_output=True, text=True, timeout=60)
+        summary = (result.stdout.strip() or result.stderr.strip()).splitlines()[-1:] or ['(no output)']
+        summary = summary[0]
+    except subprocess.TimeoutExpired:
+        summary = 'sbg_settings timed out after 60 s'
+    return [
+        LogInfo(msg=f'sbg.launch: device settings: {summary}'),
+        Node(
+            package='usv_rtk_bringup',
+            executable='sbg_settings_publisher',
+            namespace=namespace,
+            output='screen',
+            parameters=[{'settings_file': path}],
+        ),
+    ]
+
+
 def generate_launch_description():
     return LaunchDescription([
         declare_robot_name_argument(),
         declare_namespace_override_argument(SENSOR_SBG),
+        DeclareLaunchArgument(
+            'record_device_settings',
+            default_value='true',
+            description='Read the SBG settings before the driver starts and publish them on sbg/device_settings',
+        ),
         DeclareLaunchArgument(
             'gnss_stack',
             default_value=default_gnss_stack_path(),
