@@ -63,7 +63,8 @@ At launch, `sbg.launch.py` merges **vehicle** into the driver via `build_sbg_lau
 
 - `uartConf.portName` / `baudRate` from `vehicles/floatsam_usv_0.yaml` → `sbg.serial_*`
 - GNSS lever arms from `extrinsics.gnss` / `aux1` with **ROS FLU → SBG FRD** conversion
-- `output.frame_id` / `gps_frame_id` from vehicle extrinsics
+- `output.frame_id` / `gps_frame_id` from vehicle extrinsics, prefixed `<robot>/`
+- `odometry.*FrameId`: `utm` → `<robot>/sbg_odom` → `<robot>/sbg_base_link` (reference branch)
 - Shared NMEA and RTCM topic namespaces under `/{ROBOT_NAME}/`
 
 Lever arms in vehicle YAML are **ROS FLU** (X forward, Y port/left, Z up). The overlay maps them to SBG IMU FRD (X forward, Y right, Z down) to match `imuAlignementLeverArm` in the sensor YAML.
@@ -170,7 +171,9 @@ With `ROBOT_NAME=floatsam_usv_0`:
 | `/floatsam_usv_0/nmea` | `nmea_msgs/Sentence` | GGA for NTRIP |
 | `/floatsam_usv_0/rtcm` | `rtcm_msgs/Message` | RTCM corrections |
 
-Static TF from vehicle extrinsics: `base_link` → `imu` → `gnss` / `aux1` / `vsm`.
+Static TF from vehicle extrinsics, prefixed with the robot name: `<robot>/base_link` → `<robot>/imu` → `<robot>/gnss` / `<robot>/aux1` / `<robot>/vsm`.
+
+The SBG's own INS solution is published as a **reference branch**, not the main pose (robot_localization owns `map → <robot>/odom → <robot>/base_link`): `utm → <robot>/sbg_odom` (static, UTM of the SBG's first fix) and `<robot>/sbg_odom → <robot>/sbg_base_link` (dynamic). The driver only sends these in full navigation mode (`NAV_POSITION`). Compare with `ros2 run tf2_ros tf2_echo <robot>/base_link <robot>/sbg_base_link`. Plan: usv-host-setup `docs/usv-bringup-roadmap.md` WS4.
 
 ---
 

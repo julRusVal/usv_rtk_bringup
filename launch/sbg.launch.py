@@ -73,7 +73,7 @@ def launch_setup(context, *args, **kwargs):
 
     vehicle_config_path = stack['sbg_vehicle_config']
     vehicle_raw = load_vehicle_config(vehicle_config_path)
-    resolved = load_resolved_config(vehicle_config_path, {})
+    resolved = load_resolved_config(vehicle_config_path, {}, robot_name)
 
     param_overlay = build_sbg_launch_overlay(
         vehicle_raw,

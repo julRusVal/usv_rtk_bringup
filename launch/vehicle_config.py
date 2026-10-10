@@ -47,9 +47,24 @@ def flu_xyz_to_sbg_frd(x, y, z):
     return float(x), float(-y), float(-z)
 
 
-def build_sbg_param_overlay(config):
-    """Merge vehicle YAML (extrinsics, sbg serial) into sbg_driver ROS parameters."""
-    extrinsics = resolve_extrinsics(config)
+def prefixed_frame(robot_name, frame):
+    """'<robot_name>/<frame>' (REP-105 multi-robot style); unchanged if robot_name is empty or the
+    frame already has a prefix."""
+    robot = (robot_name or '').strip('/')
+    if not robot or '/' in frame:
+        return frame
+    return f'{robot}/{frame}'
+
+
+def build_sbg_param_overlay(config, robot_name=''):
+    """Merge vehicle YAML (extrinsics, sbg serial) into sbg_driver ROS parameters.
+
+    With robot_name, all frames are prefixed (<robot>/imu, <robot>/gnss) and the SBG's own INS
+    solution goes to a parallel reference branch utm -> <robot>/sbg_odom -> <robot>/sbg_base_link
+    (only published in full navigation mode), never the main odom/base_link (robot_localization owns
+    those). See usv-host-setup docs/usv-bringup-roadmap.md WS4.
+    """
+    extrinsics = resolve_extrinsics(config, robot_name)
     sbg = resolve_sbg(config)
     gnss = extrinsics['gnss']
     aux1 = extrinsics['aux1']
@@ -69,6 +84,9 @@ def build_sbg_param_overlay(config):
         'gnss.secondaryLeverArmZ': sz,
         'output.frame_id': imu.get('child_frame', 'imu'),
         'output.gps_frame_id': gnss.get('child_frame', 'gnss'),
+        'odometry.initFrameId': 'utm',
+        'odometry.odomFrameId': prefixed_frame(robot_name, 'sbg_odom'),
+        'odometry.baseFrameId': prefixed_frame(robot_name, 'sbg_base_link'),
     }
 
     if any(v != 0.0 for v in (sx, sy, sz)):
@@ -101,7 +119,7 @@ def build_sbg_launch_overlay(
     topic_namespace = robot_topic_namespace(robot_name)
 
     return {
-        **build_sbg_param_overlay(vehicle_raw),
+        **build_sbg_param_overlay(vehicle_raw, robot_name),
         'rtcm.namespace': topic_namespace,
         'rtcm.topic_name': 'rtcm' if topic_namespace else resolved_rtcm.lstrip('/'),
         'rtcm.subscribe': True,
@@ -253,21 +271,23 @@ def resolve_device_uri(network):
     return f"tcp://{network['receiver_ip']}:{network['receiver_port']}"
 
 
-def resolve_extrinsics(config):
+def resolve_extrinsics(config, robot_name=''):
+    """Extrinsics with defaults; frame names prefixed with robot_name when given."""
     extrinsics = dict(config.get('extrinsics', {}))
-    extrinsics.setdefault('base_frame', 'base_link')
+    extrinsics['base_frame'] = prefixed_frame(robot_name, extrinsics.get('base_frame', 'base_link'))
     for name in ('imu', 'gnss', 'aux1', 'vsm'):
-        extrinsics.setdefault(name, {})
-        extrinsics[name].setdefault('child_frame', name)
-        extrinsics[name].setdefault('xyz', [0.0, 0.0, 0.0])
-        extrinsics[name].setdefault('rpy', [0.0, 0.0, 0.0])
+        entry = dict(extrinsics.get(name, {}))
+        entry['child_frame'] = prefixed_frame(robot_name, entry.get('child_frame', name))
+        entry.setdefault('xyz', [0.0, 0.0, 0.0])
+        entry.setdefault('rpy', [0.0, 0.0, 0.0])
+        extrinsics[name] = entry
     return extrinsics
 
 
-def load_resolved_config(vehicle_config_path, overrides):
+def load_resolved_config(vehicle_config_path, overrides, robot_name=''):
     config = load_vehicle_config(vehicle_config_path)
     network = resolve_network(config, overrides)
-    extrinsics = resolve_extrinsics(config)
+    extrinsics = resolve_extrinsics(config, robot_name)
     return {
         'vehicle': dict(config.get('vehicle', {})),
         'network': network,
