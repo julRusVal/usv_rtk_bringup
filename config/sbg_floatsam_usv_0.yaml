@@ -142,7 +142,9 @@
       # 7 Synchronization is done using SYNC_OUT_B pin
       gnss1ModuleSyncAssignment: 5
       # RTCM input port assignment for Ellipse-N DGPS (see gnss1ModulePortAssignment for values)
-      rtcmPortAssignment: 255
+      # 0 = PORT_A: NTRIP corrections arrive on the same serial link (sbg_driver writes /<robot>/rtcm to port A).
+      # Matches the device (sbg_settings 2026-10-10); firmware 3 refuses writes to this section anyway.
+      rtcmPortAssignment: 0
       # Odometer module pin assignment
       # 0 Odometer is disabled
       # 1 Odometer connected only to ODO_A (unidirectional).
@@ -185,8 +187,9 @@
       # 103 Used on Ellipse-N to setup the internal GNSS in GPS+BEIDOU
       # 104 Used on Ellipse-E to setup a connection to ublox in read only mode.
       # 106 Used on Ellipse-E to setup a connection to Novatel receiver in read only mode.
-      # 107 Used on Ellipse-D by default
-      gnss_model_id: 107
+      # 107 Used on Ellipse-D by default (firmware 2)
+      # 101 = INTERNAL: what this Ellipse-D (firmware 3.0) reports; it refuses writes to the model (sbg_settings 2026-10-10).
+      gnss_model_id: 101
 
       #GNSS primary antenna lever arm in IMU X axis (m) — set in config/vehicles/*.yaml
       primaryLeverArmX: 0.0
@@ -195,7 +198,8 @@
       #GNSS primary antenna lever arm in IMU Z axis (m)
       primaryLeverArmZ: 0.0
       #GNSS primary antenna precise. Set to true if the primary lever arm has been accurately entered and doesn't need online re-estimation.
-      primaryLeverPrecise: false
+      # true: lever arms measured (2026-10). Firmware 3 always keeps true (deprecated field); false caused a rewrite + reboot at every start.
+      primaryLeverPrecise: true
 
       #GNSS secondary antenna lever arm (dual-antenna) — set in config/vehicles/*.yaml
       secondaryLeverArmX: 0.0
@@ -204,7 +208,7 @@
       #GNSS secondary antenna lever arm in IMU Z axis (m)
       secondaryLeverArmZ: 0.0
 
-      # secondaryLeverMode set at launch when secondary lever arm is non-zero
+      # secondaryLeverMode set at launch when secondary lever arm is non-zero: 4 = DUAL_PRECISE (vehicle_config.py)
 
       # Rejection mode for position
       # 0 Measurement is not taken into account

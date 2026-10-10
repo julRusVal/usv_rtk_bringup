@@ -90,7 +90,9 @@ def build_sbg_param_overlay(config, robot_name=''):
     }
 
     if any(v != 0.0 for v in (sx, sy, sz)):
-        overlay['gnss.secondaryLeverMode'] = 3
+        # 4 = DUAL_PRECISE: measured secondary lever arm. (3 = DUAL_ROUGH is deprecated; firmware 3 stores it as 4, so
+        # asking for 3 made the driver see a difference, rewrite and reboot the SBG on every start.)
+        overlay['gnss.secondaryLeverMode'] = 4
 
     return overlay
 

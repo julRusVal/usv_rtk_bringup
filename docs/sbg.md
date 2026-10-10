@@ -286,3 +286,8 @@ SBG_DRIVER - productCode = ELLIPSE-D-...
 DUAL_PRECISE, ours 3: firmware 3 stores DUAL_ROUGH as DUAL_PRECISE) and `primaryPrecise` (device true, ours false) cause
 a rewrite + reboot on every launch; `rtcmPort` (device port A, ours DISABLED) and `gnssModel` (device 101 INTERNAL,
 ours 107) can't be written by the driver on this firmware ("not available") and stay as on the device.
+
+**Fixed the same day:** our config now asks for what the device keeps — `secondaryLeverMode` 4 (DUAL_PRECISE),
+`primaryLeverPrecise: true`, `rtcmPortAssignment: 0` (port A), `gnss_model_id: 101` (INTERNAL). `sbg_settings` → 0 of 64
+differ; a driver start no longer logs "lever arm updated" / "settings saved and device rebooted" (or "not available"),
+so the SBG keeps its alignment and RTK state across driver restarts.
