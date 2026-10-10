@@ -8,8 +8,8 @@ Edit [`config/gnss_stack.yaml`](config/gnss_stack.yaml) (`primary.module`) or ov
 
 | Module | `gnss_stack.yaml` | Launch |
 |--------|-------------------|--------|
-| Septentrio RTK (default) | `module: septentrio`, `profile: rtk` | `ros2 launch usv_rtk_bringup all_gnss.launch.py` |
-| SBG Ellipse-D | `module: sbg` | `ros2 launch usv_rtk_bringup all_gnss.launch.py` or `module:=sbg` |
+| Septentrio RTK | `module: septentrio`, `profile: rtk` | `ros2 launch usv_rtk_bringup all_gnss.launch.py module:=septentrio` |
+| SBG Ellipse-D (default) | `module: sbg` | `ros2 launch usv_rtk_bringup all_gnss.launch.py` (bringup: `sbg.launch.py`) |
 | u-blox F9P | `module: ublox` | `ros2 launch usv_rtk_bringup all_gnss.launch.py module:=ublox` |
 | + auto NTRIP | `ntrip.auto_launch: true` | or `enable_ntrip:=true` on the same launch |
 
@@ -80,7 +80,7 @@ Set `ROBOT_NAME` once per vehicle (see [Robot namespace](#robot-namespace)). Sou
 
 | What you want | Command |
 |---------------|---------|
-| Septentrio RTK (default) | `ros2 launch usv_rtk_bringup all_gnss.launch.py` |
+| Septentrio RTK | `ros2 launch usv_rtk_bringup all_gnss.launch.py module:=septentrio` |
 | GNSS only, no RTK | `ros2 launch usv_rtk_bringup all_gnss.launch.py profile:=gnss` |
 | RTK + dual-antenna heading | `ros2 launch usv_rtk_bringup all_gnss.launch.py profile:=rtk_heading` |
 | u-blox only | `ros2 launch usv_rtk_bringup all_gnss.launch.py profile:=none enable_ublox:=true` |
@@ -101,7 +101,7 @@ Or launch individual drivers directly: `rtk.launch.py`, `gnss.launch.py`, `ublox
 
 | Variable / arg | Default | Effect |
 |---|---|---|
-| `ROBOT_NAME` (env) | `floatsam0` | Set in `usv-host-setup/config/usv-robot.env.sh`, sourced by `ros-zenoh.env.sh` and `px4-ros.env.sh` |
+| `ROBOT_NAME` (env) | `floatsam_usv_0` | From `usv-host-setup/config/robot.yaml` (read by `usv-robot.env.sh`, sourced via `floatsam.env.sh`) |
 | `robot_name` (launch) | `$ROBOT_NAME` | Override per launch: `robot_name:=floatsam1` |
 | `namespace` (launch) | _(empty)_ | Full override; default is `{robot_name}/{sensor}` |
 
@@ -414,10 +414,15 @@ usv_rtk_bringup/
 │   ├── rtk_heading.yaml
 │   ├── gnss_stack.yaml
 │   ├── sbg_ellipse_d.yaml
+│   ├── sbg_floatsam_usv_0.yaml
 │   ├── secrets.yaml.example
-│   └── usv.yaml
+│   ├── ublox.yaml
+│   ├── usv.yaml
+│   └── vehicles/floatsam_usv_0.yaml
 ├── docs/
 │   ├── gnss_link_monitor.md
+│   ├── sbg.md
+│   ├── TODO.md
 │   ├── verify_rtk_corrections.md
 │   └── mosaic-G5 Firmware … (reference PDFs)
 ├── udev/
@@ -429,8 +434,12 @@ usv_rtk_bringup/
 │   ├── dual_antenna_attitude_remap
 │   ├── attitude_remap.py
 │   ├── check_swepos
+│   ├── merge_sbg_params
 │   ├── ntrip_aux_client
-│   └── ntrip_secrets.py
+│   ├── ntrip_ros_client
+│   ├── ntrip_secrets.py
+│   ├── sbg_settings
+│   └── sbg_settings_publisher
 └── launch/
     ├── all_gnss.launch.py
     ├── bringup.launch.py

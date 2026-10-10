@@ -15,10 +15,10 @@ ros2 daemon stop   # if node/topic list looks stale
 
 | Module | Config | NTRIP GGA source | RTCM delivery | Topics (under `/floatsam_usv_0/…`) |
 |--------|--------|------------------|---------------|-------------------------------|
-| `septentrio` + `profile: rtk` **(default)** | `config/rtk.yaml` | aux serial (`/dev/usv-rtk-aux`) | aux serial + optional ROS | `septentrio/navsatfix`, `pvtgeodetic`, … |
+| `septentrio` + `profile: rtk` | `config/rtk.yaml` | aux serial (`/dev/usv-rtk-aux`) | aux serial + optional ROS | `septentrio/navsatfix`, `pvtgeodetic`, … |
 | `septentrio` + `profile: gnss` | `config/gnss.yaml` | aux serial | same | same namespace, no RTK on USB2 |
 | `septentrio` + `profile: rtk_heading` | `rtk.yaml` + `rtk_heading.yaml` | aux serial | same | + `septentrio/heading`, `yaw`, `imu`, … |
-| `sbg` | `config/sbg_floatsam_usv_0.yaml` + `config/vehicles/floatsam_usv_0.yaml` | ROS `/nmea` from driver | ROS `/{robot}/rtcm` only | `sbg/*` — see [docs/sbg.md](../docs/sbg.md) |
+| `sbg` **(default)** | `config/sbg_floatsam_usv_0.yaml` + `config/vehicles/floatsam_usv_0.yaml` | ROS `/nmea` from driver | ROS `/{robot}/rtcm` only | `sbg/*` — see [docs/sbg.md](../docs/sbg.md) |
 | `ublox` | `config/ublox.yaml` | aux serial (if available) | ROS `/{robot}/rtcm` only | `ublox/fix`, … |
 
 Override without editing YAML:
@@ -31,7 +31,7 @@ ros2 launch usv_rtk_bringup all_gnss.launch.py profile:=rtk_heading
 
 ## Vehicle vs sensor config
 
-| Layer | SBG (`module:=sbg`) | Septentrio (default) |
+| Layer | SBG (`module:=sbg`, default) | Septentrio |
 |-------|---------------------|----------------------|
 | Per-hull geometry, serial | `config/vehicles/floatsam_usv_0.yaml` (via `gnss_stack.yaml` → `vehicle_config`) | `config/usv.yaml` |
 | Sensor/driver tuning | `config/sbg_floatsam_usv_0.yaml` | `config/rtk.yaml`, `config/gnss.yaml`, … |
@@ -54,7 +54,7 @@ Credentials in `config/secrets.yaml`. All modules can share `/{ROBOT_NAME}/rtcm`
 
 | Client | Use when | GGA in | RTCM out |
 |--------|----------|--------|----------|
-| [`ntrip_aux_client`](../utilities/ntrip_aux_client) | Septentrio (default) | aux serial `/dev/usv-rtk-aux` | aux serial (+ optional ROS) |
+| [`ntrip_aux_client`](../utilities/ntrip_aux_client) | Septentrio | aux serial `/dev/usv-rtk-aux` | aux serial (+ optional ROS) |
 | [`ntrip_ros_client`](../utilities/ntrip_ros_client) | SBG, ROS-only paths | `nmea_msgs/Sentence` topic | `rtcm_msgs/Message` topic |
 
 Both clients connect to the caster **only with a valid GGA fix** and disconnect when the fix is lost or stale.
@@ -109,7 +109,7 @@ all_gnss.launch.py
 | `gnss_stack` | `config/gnss_stack.yaml` | Module + NTRIP defaults |
 | `enable_ntrip` | from YAML `ntrip.auto_launch` | `true` / `false` |
 | `enable_ublox` | `false` | Add u-blox alongside Septentrio |
-| `robot_name` | `$ROBOT_NAME` | From `usv-robot.env.sh` |
+| `robot_name` | `$ROBOT_NAME` | From `config/robot.yaml` (via `floatsam.env.sh`) |
 | `log_level` | `INFO` | |
 
 ```bash

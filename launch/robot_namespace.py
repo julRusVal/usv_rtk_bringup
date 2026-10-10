@@ -68,7 +68,7 @@ def declare_robot_name_argument():
         default_value=EnvironmentVariable('ROBOT_NAME', default_value=''),
         description='Top-level robot namespace (e.g. floatsam_usv_0). '
         'GNSS topics are under {robot_name}/{ublox|septentrio|sbg}/. '
-        'Set ROBOT_NAME in usv-host-setup/config/usv-robot.env.sh.',
+        'ROBOT_NAME comes from usv-host-setup/config/robot.yaml (via floatsam.env.sh).',
     )
 
 
