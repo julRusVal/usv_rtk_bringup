@@ -300,7 +300,9 @@
       # Position and velocities in NED coordinates with the accuracies on each axis
       log_ekf_nav: 8
       # Velocity expressed in the INS body/vehicle frame
-      log_ekf_vel_body: 0
+      # 25 Hz: body-frame velocity (FLU with use_enu) + 1-sigma accuracy for robot_localization (WS4 step 3,
+      # usv_localization_bringup sbg_body_velocity -> twist input of both EKFs)
+      log_ekf_vel_body: 8
       # Rotations rate and accelerations in the INS body/vehicle frame
       log_ekf_rot_accel_body: 0
       # Rotations rate and accelerations in North, East, Down (NED) navigation frame
