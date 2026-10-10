@@ -15,6 +15,7 @@ std_msgs/String, transient-local (late subscribers and `ros2 bag record` get it 
 import json
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
@@ -53,12 +54,14 @@ def main():
     node = SbgSettingsPublisher()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        try:
+            rclpy.try_shutdown()
+        except Exception:  # rclpy's own SIGINT handler may shut the context down concurrently (Jazzy race)
+            pass
 
 
 if __name__ == '__main__':

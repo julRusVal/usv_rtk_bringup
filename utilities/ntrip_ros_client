@@ -35,6 +35,7 @@ try:
     from pygnssutils.globals import FIXTYPE_GGA
     from pygnssutils.gnssntripclient import GNSSNTRIPClient
     from rclpy.node import Node
+    from rclpy.executors import ExternalShutdownException
     from rtcm_msgs.msg import Message
 except ImportError:
     print(
@@ -414,19 +415,24 @@ def main() -> int:
 
     def _signal_handler(_signum, _frame):
         node.shutdown()
+        # Also stop rclpy, so spin() returns and the process exits. (Before 2026-10-10 the handler only
+        # disconnected: the process kept spinning, an orphan after every stopped launch, holding a SWEPOS login.)
+        rclpy.try_shutdown()
 
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.shutdown()
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        try:
+            node.destroy_node()
+            rclpy.try_shutdown()
+        except Exception:  # context may already be shut down (concurrently, by rclpy's own SIGINT handler)
+            pass
 
     return 0
 
