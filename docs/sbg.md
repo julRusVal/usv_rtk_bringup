@@ -274,3 +274,15 @@ SBG_DRIVER - productCode = ELLIPSE-D-...
 - [gnss_link_monitor.md](gnss_link_monitor.md) — live fix/RTCM dashboard
 - [TODO.md](TODO.md) — Septentrio vehicle YAML merge still pending
 - [Upstream sbg_ros2_driver](https://github.com/SBG-Systems/sbg_ros2_driver)
+
+## Checking what the device actually stores
+
+`ros2 run usv_rtk_bringup sbg_settings` reads every setting sbg_driver configures straight from the Ellipse (sbgECom
+"get" commands only — nothing written) and compares it with our merged configuration; `--all` lists everything,
+`--json` is machine-readable. Stop the driver first (it owns the port). A mismatch is exactly what the driver rewrites
+(then saves + reboots the SBG) at every start.
+
+2026-10-10 (firmware 3.0.3949): 64 settings readable, 4 differ — GNSS installation `secondaryMode` (device 4
+DUAL_PRECISE, ours 3: firmware 3 stores DUAL_ROUGH as DUAL_PRECISE) and `primaryPrecise` (device true, ours false) cause
+a rewrite + reboot on every launch; `rtcmPort` (device port A, ours DISABLED) and `gnssModel` (device 101 INTERNAL,
+ours 107) can't be written by the driver on this firmware ("not available") and stay as on the device.

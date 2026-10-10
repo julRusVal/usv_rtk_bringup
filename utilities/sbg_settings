@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""Read the settings stored on the SBG Ellipse and compare them with our configuration (read-only).
+
+Talks to the device directly over its serial port with sbgECom "get" commands only — nothing is
+written, saved or rebooted. Covers every section sbg_driver configures (confWithRos): initial
+conditions, motion profile, IMU alignment/lever arm, aiding assignment, magnetometer model and
+rejection, GNSS model / installation (lever arms + modes) / rejection, odometer, and the output rate
+of every log. "Ours" is the merged driver configuration the launch would use (same code as
+sbg.launch.py / merge_sbg_params), so a mismatch here is exactly what the driver rewrites at start.
+
+  ros2 run usv_rtk_bringup sbg_settings                 # table: device vs ours, mismatches flagged
+  ros2 run usv_rtk_bringup sbg_settings --json          # machine-readable (for bags / records)
+  ros2 run usv_rtk_bringup sbg_settings --port /dev/usv-sbg --baud 921600
+
+The SBG driver must NOT be running (it owns the serial port). Protocol per sbgECom 5.3 in
+sbg_ros2_driver/external/sbgECom (frame: FF 5A id class len16 payload crc16 33, CRC-16/KERMIT over
+id..payload; a GET is class 0x10 + command id, answered with the same id or an ACK id 0 + error).
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import struct
+import sys
+import time
+from pathlib import Path
+
+import serial
+
+LAUNCH_DIR = Path(__file__).resolve().parent.parent / 'launch'
+sys.path.insert(0, str(LAUNCH_DIR))
+
+CMD_CLASS = 0x10
+CMD_ACK = 0
+ERRORS = {0: 'NO_ERROR', 1: 'ERROR', 3: 'INVALID_CRC', 4: 'INVALID_FRAME', 5: 'TIME_OUT',
+          9: 'INVALID_PARAMETER', 10: 'NOT_READY', 19: 'INCOMPATIBLE_HARDWARE', 20: 'INVALID_VERSION'}
+REJECT = {0: 'NEVER_ACCEPT', 1: 'AUTOMATIC', 2: 'ALWAYS_ACCEPT'}
+AXIS = {0: 'FORWARD', 1: 'BACKWARD', 2: 'LEFT', 3: 'RIGHT', 4: 'UP', 5: 'DOWN'}
+MOTION = {1: 'GENERAL_PURPOSE', 2: 'AUTOMOTIVE', 3: 'MARINE', 4: 'AIRPLANE', 5: 'HELICOPTER', 6: 'PEDESTRIAN',
+          7: 'UAV_ROTARY_WING', 8: 'HEAVY_MACHINERY', 9: 'STATIC', 10: 'TRUCK', 11: 'RAILWAY',
+          12: 'OFF_ROAD_VEHICLE', 13: 'UNDERWATER'}
+MAG_MODEL = {201: 'INTERNAL_NORMAL', 202: 'INTERNAL_RESERVED', 203: 'ECOM_NORMAL'}
+GNSS_MODEL = {101: 'INTERNAL', 102: 'NMEA', 103: 'UBLOX_GPS_BEIDOU', 104: 'UBLOX_EXTERNAL', 106: 'NOVATEL_EXTERNAL',
+              109: 'SEPTENTRIO_EXTERNAL'}
+GNSS_MODE = {1: 'SINGLE', 2: 'DUAL_AUTO', 3: 'DUAL_ROUGH (deprecated, stored as DUAL_PRECISE)', 4: 'DUAL_PRECISE'}
+PORT = {0: 'A', 1: 'B', 2: 'C', 3: 'D', 4: 'E', 5: 'INTERNAL', 0xFF: 'DISABLED'}
+OUT_MODE = {0: 'DISABLED', 1: '200 Hz', 2: '100 Hz', 4: '50 Hz', 5: '40 Hz', 8: '25 Hz', 10: '20 Hz', 20: '10 Hz',
+            40: '5 Hz', 100: '2 Hz', 200: '1 Hz', 1001: '1 kHz', 1002: '500 Hz', 1004: '250 Hz', 10000: 'PPS',
+            10001: 'NEW_DATA', 20001: 'HIGH_FREQ_LOOP'}
+# output.log_* parameter -> sbgECom log id (class 0), as in sbg_driver config_store.cpp
+LOGS = {'status': 1, 'utc_time': 2, 'imu_data': 3, 'mag': 4, 'mag_calib': 5, 'ekf_euler': 6, 'ekf_quat': 7,
+        'ekf_nav': 8, 'ship_motion': 9, 'gps1_vel': 13, 'gps1_pos': 14, 'gps1_hdt': 15, 'odo_vel': 19,
+        'event_a': 24, 'event_b': 25, 'event_c': 26, 'event_d': 27, 'event_e': 28, 'gps1_raw': 31,
+        'air_data': 36, 'imu_short': 44, 'ekf_rot_accel_body': 52, 'ekf_rot_accel_ned': 53, 'ekf_vel_body': 54}
+
+
+# ----------------------------------------------------------------------------------------- protocol
+
+def crc16(data: bytes) -> int:
+    """CRC-16/KERMIT (poly 0x8408 reflected, init 0) — sbgECom common/crc/sbgCrc.c."""
+    crc = 0
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x8408 if crc & 1 else crc >> 1
+    return crc
+
+
+def frame(msg_id: int, msg_class: int, payload: bytes = b'') -> bytes:
+    body = struct.pack('<BBH', msg_id, msg_class, len(payload)) + payload
+    return b'\xff\x5a' + body + struct.pack('<H', crc16(body)) + b'\x33'
+
+
+class SbgLink:
+    def __init__(self, port: str, baud: int):
+        self.ser = serial.Serial(port, baud, timeout=0.05, exclusive=True)
+        self.buf = bytearray()
+
+    def _frames(self):
+        """Yield (msg_id, msg_class, payload) for every valid frame in the buffer."""
+        while True:
+            i = self.buf.find(b'\xff\x5a')
+            if i < 0:
+                del self.buf[:-1 if self.buf.endswith(b'\xff') else len(self.buf)]
+                return
+            del self.buf[:i]
+            if len(self.buf) < 6:
+                return
+            msg_id, msg_class, length = struct.unpack_from('<BBH', self.buf, 2)
+            if length > 4086:
+                del self.buf[:2]
+                continue
+            end = 6 + length + 3
+            if len(self.buf) < end:
+                return
+            crc, etx = struct.unpack_from('<HB', self.buf, 6 + length)
+            if etx != 0x33 or crc != crc16(bytes(self.buf[2:6 + length])):
+                del self.buf[:2]          # sbgEComProtocol.c: skip the sync pair and search again
+                continue
+            payload = bytes(self.buf[6:6 + length])
+            del self.buf[:end]
+            yield msg_id, msg_class, payload
+
+    def get(self, cmd_id: int, payload: bytes = b'', timeout: float = 0.5, attempts: int = 3):
+        """Return (payload, None) or (None, error_name). Logs streaming meanwhile are skipped."""
+        err = 'TIME_OUT'
+        for _ in range(attempts):
+            self.ser.write(frame(cmd_id, CMD_CLASS, payload))
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                self.buf += self.ser.read(4096)
+                for mid, mcls, data in self._frames():
+                    if mcls != CMD_CLASS:
+                        continue
+                    if mid == cmd_id:
+                        return data, None
+                    if mid == CMD_ACK and len(data) == 4:
+                        ack_id, ack_cls, code = struct.unpack('<BBH', data)
+                        if ack_id == cmd_id and ack_cls == CMD_CLASS:
+                            err = ERRORS.get(code, f'error {code}')
+                            if code == 9:          # INVALID_PARAMETER: not available — retrying won't help
+                                return None, err
+                            deadline = 0
+                            break
+        return None, err
+
+
+# ----------------------------------------------------------------------------------------- device reads
+
+def version(v: int) -> str:
+    if v & 0x80000000:
+        qual = {0: 'dev', 1: 'alpha', 2: 'beta', 3: 'rc', 4: 'stable', 5: 'hotfix'}.get((v >> 28) & 7, '?')
+        return f'{(v >> 22) & 0x3F}.{(v >> 16) & 0x3F}.{v & 0xFFFF}-{qual}'
+    return f'{v >> 24}.{(v >> 16) & 0xFF}.{(v >> 8) & 0xFF}.{v & 0xFF}'
+
+
+def read_device(link: SbgLink, port_id: int) -> dict:
+    out: dict = {}
+
+    def read(name, cmd, size, parse, payload=b'', at_least=False):
+        data, err = link.get(cmd, payload)
+        if err:
+            out[name] = {'error': err}
+        elif len(data) != size and not (at_least and len(data) > size):
+            out[name] = {'error': f'unexpected length {len(data)} (expected {size})'}
+        else:
+            out[name] = parse(data[:size])
+            if len(data) > size:
+                extra[name] = data[size:].hex(' ')
+
+    extra: dict = {}
+
+    def info(d):
+        code, serial_no, cal_rev, year, month, day, hw, fw = struct.unpack('<32sIIHBBII', d)
+        return {'productCode': code.split(b'\0')[0].decode(errors='replace'), 'serialNumber': serial_no,
+                'calibrationRev': version(cal_rev), 'calibrationDate': f'{year:04d}-{month:02d}-{day:02d}',
+                'hardwareRev': version(hw), 'firmwareRev': version(fw)}
+
+    read('info', 4, 52, info)
+    read('initCondition', 5, 28, lambda d: dict(zip(('latitude', 'longitude', 'altitude', 'year', 'month', 'day'),
+                                                    struct.unpack('<dddHBB', d))))
+    # model-id GETs: the library reads the first u32 and ignores the rest (firmware 3 sends 8 bytes)
+    read('motionProfile', 7, 4, lambda d: struct.unpack('<I', d)[0], at_least=True)
+    read('imuAlignment', 8, 26, lambda d: dict(zip(
+        ('axisDirectionX', 'axisDirectionY', 'misRoll', 'misPitch', 'misYaw', 'leverArmX', 'leverArmY', 'leverArmZ'),
+        struct.unpack('<BBffffff', d))))
+    read('aidingAssignment', 9, 11, lambda d: dict(zip(
+        ('gnss1Port', 'gnss1Sync', 'dvlPort', 'dvlSync', 'rtcmPort', 'airDataPort', 'odometerPins'),
+        struct.unpack('<BB4xBBBBB', d))))
+    read('magModel', 11, 4, lambda d: struct.unpack('<I', d)[0], at_least=True)
+    read('magRejection', 12, 1, lambda d: d[0])
+    read('gnssModel', 17, 4, lambda d: struct.unpack('<I', d)[0], at_least=True)
+    read('gnssInstallation', 46, 26, lambda d: dict(zip(
+        ('primaryX', 'primaryY', 'primaryZ', 'primaryPrecise', 'secondaryX', 'secondaryY', 'secondaryZ', 'secondaryMode'),
+        struct.unpack('<fff?fffB', d))))
+    read('gnssRejection', 19, 4, lambda d: dict(zip(('position', 'velocity', 'hdt'), struct.unpack('<BBxB', d))))
+    read('odometer', 20, 6, lambda d: dict(zip(('gain', 'gainError', 'reverseMode'), struct.unpack('<fB?', d))))
+    read('odometerLeverArm', 21, 12, lambda d: dict(zip(('x', 'y', 'z'), struct.unpack('<fff', d))))
+    read('odometerRejection', 22, 1, lambda d: d[0])
+    outputs = {}
+    for name, log_id in LOGS.items():
+        data, err = link.get(30, bytes((port_id, log_id, 0)))
+        if err:
+            outputs[name] = {'error': err}
+        elif len(data) != 5:
+            outputs[name] = {'error': f'unexpected length {len(data)}'}
+        else:
+            outputs[name] = struct.unpack('<BBBH', data)[3]
+    out['outputs'] = outputs
+    if extra:
+        out['extraBytes'] = extra
+    return out
+
+
+def port_users(port: str) -> list[str]:
+    """Processes that have the serial device open (the driver must not be running)."""
+    target = os.path.realpath(port)
+    users = []
+    for proc in Path('/proc').iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            if any(os.path.realpath(fd) == target for fd in (proc / 'fd').iterdir()):
+                users.append(f'{(proc / "comm").read_text().strip()} (pid {proc.name})')
+        except (PermissionError, FileNotFoundError, ProcessLookupError):
+            continue
+    return users
+
+
+# ----------------------------------------------------------------------------------------- our config
+
+def load_ours(robot_name: str) -> tuple[dict, dict]:
+    """Merged sbg_driver params exactly as sbg.launch.py builds them (+ where they came from)."""
+    from gnss_stack import default_gnss_stack_path, resolve_gnss_stack
+    from vehicle_config import merge_sbg_driver_params
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        pkg_share = Path(get_package_share_directory('usv_rtk_bringup'))
+    except Exception:
+        pkg_share = Path(__file__).resolve().parent.parent
+    stack = resolve_gnss_stack(str(default_gnss_stack_path()), module_override='sbg', robot_name=robot_name,
+                               pkg_share=str(pkg_share))
+
+    def resolve(p):
+        for c in (Path(p), pkg_share / p, Path(__file__).resolve().parent.parent / p):
+            if c.is_file():
+                return str(c)
+        return p
+    sbg_params, vehicle = resolve(stack['sbg_params_file']), resolve(stack['sbg_vehicle_config'])
+    merged = merge_sbg_driver_params(sbg_params, vehicle, robot_name)['/**']['ros__parameters']
+    return merged, {'sbg_params': sbg_params, 'vehicle_config': vehicle, 'robot_name': robot_name}
+
+
+def ours_expected(p: dict) -> dict:
+    """Same keys/defaults as sbg_driver config_store.cpp."""
+    g = lambda section, key, default: p.get(section, {}).get(key, default)  # noqa: E731
+    return {
+        'initCondition': {'latitude': g('sensorParameters', 'initLat', 48.419727),
+                          'longitude': g('sensorParameters', 'initLong', -4.472119),
+                          'altitude': g('sensorParameters', 'initAlt', 100.0),
+                          'year': g('sensorParameters', 'year', 2018), 'month': g('sensorParameters', 'month', 3),
+                          'day': g('sensorParameters', 'day', 10)},
+        'motionProfile': g('sensorParameters', 'motionProfile', 1),
+        'imuAlignment': {'axisDirectionX': g('imuAlignementLeverArm', 'axisDirectionX', 0),
+                         'axisDirectionY': g('imuAlignementLeverArm', 'axisDirectionY', 0),
+                         **{k: g('imuAlignementLeverArm', k, 0.0) for k in
+                            ('misRoll', 'misPitch', 'misYaw', 'leverArmX', 'leverArmY', 'leverArmZ')}},
+        'aidingAssignment': {'gnss1Port': g('aidingAssignment', 'gnss1ModulePortAssignment', None),
+                             'gnss1Sync': g('aidingAssignment', 'gnss1ModuleSyncAssignment', None),
+                             'rtcmPort': g('aidingAssignment', 'rtcmPortAssignment', 0xFF),
+                             'odometerPins': g('aidingAssignment', 'odometerPinAssignment', 0)},
+        'magModel': g('magnetometer', 'magnetometerModel', 201),
+        'magRejection': g('magnetometer', 'magnetometerRejectMode', 1),
+        'gnssModel': g('gnss', 'gnss_model_id', 102),
+        'gnssInstallation': {'primaryX': g('gnss', 'primaryLeverArmX', 0.0), 'primaryY': g('gnss', 'primaryLeverArmY', 0.0),
+                             'primaryZ': g('gnss', 'primaryLeverArmZ', 0.0),
+                             'primaryPrecise': g('gnss', 'primaryLeverPrecise', True),
+                             'secondaryX': g('gnss', 'secondaryLeverArmX', 0.0),
+                             'secondaryY': g('gnss', 'secondaryLeverArmY', 0.0),
+                             'secondaryZ': g('gnss', 'secondaryLeverArmZ', 0.0),
+                             'secondaryMode': g('gnss', 'secondaryLeverMode', 1)},
+        'gnssRejection': {'position': g('gnss', 'posRejectMode', 1), 'velocity': g('gnss', 'velRejectMode', 1),
+                          'hdt': g('gnss', 'hdtRejectMode', 1)},
+        'odometer': {'gain': g('odom', 'gain', 4800.0), 'gainError': g('odom', 'gain_error', 0),
+                     'reverseMode': g('odom', 'direction', False)},
+        'odometerLeverArm': {'x': g('odom', 'leverArmX', 0.0), 'y': g('odom', 'leverArmY', 0.0),
+                             'z': g('odom', 'leverArmZ', 0.0)},
+        'odometerRejection': g('odom', 'rejectMode', 1),
+        'outputs': {name: g('output', f'log_{name}', 0) for name in LOGS},
+    }
+
+
+# ----------------------------------------------------------------------------------------- compare / report
+
+def f32(x):
+    return struct.unpack('<f', struct.pack('<f', float(x)))[0]
+
+
+def compare(device, ours, path=''):
+    """Rows (path, device, ours, verdict). verdict: ok | DIFF | ~float (equal within 1e-5, not bit-exact: the
+    driver's exact comparison still counts it as different) | n/a (not readable on this device)."""
+    rows = []
+    if isinstance(ours, dict):
+        if isinstance(device, dict) and 'error' in device:
+            return [(path, device['error'], 'configured', 'n/a')]
+        for k, v in ours.items():
+            rows += compare(device.get(k) if isinstance(device, dict) else None, v, f'{path}.{k}' if path else k)
+        return rows
+    if isinstance(device, dict) and 'error' in device:
+        return [(path, device['error'], ours, 'n/a')]
+    if ours is None:
+        return [(path, device, '(driver default)', 'ok')]
+    if isinstance(ours, float) or isinstance(device, float):
+        if f32(ours) == f32(device):
+            v = 'ok'
+        else:
+            v = '~float' if abs(float(device) - float(ours)) < 1e-5 else 'DIFF'
+        return [(path, device, ours, v)]
+    return [(path, device, ours, 'ok' if int(device) == int(ours) else 'DIFF')]
+
+
+def label(path, value):
+    if isinstance(value, (str, type(None))) or isinstance(value, float):
+        return f'{value:.4f}' if isinstance(value, float) else str(value)
+    leaf = path.split('.')[-1]
+    table = {'motionProfile': MOTION, 'magModel': MAG_MODEL, 'gnssModel': GNSS_MODEL, 'secondaryMode': GNSS_MODE,
+             'magRejection': REJECT, 'odometerRejection': REJECT, 'axisDirectionX': AXIS, 'axisDirectionY': AXIS,
+             'gnss1Port': PORT, 'rtcmPort': PORT}.get(leaf)
+    if path.startswith('gnssRejection'):
+        table = REJECT
+    if path.startswith('outputs.'):
+        table = OUT_MODE
+    if isinstance(value, bool):
+        return str(value)
+    return f'{value} {table[value]}' if table and value in table else str(value)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--port', help='serial device (default: uartConf.portName from our config)')
+    ap.add_argument('--baud', type=int, help='baud rate (default: uartConf.baudRate from our config)')
+    ap.add_argument('--robot-name', default=os.environ.get('ROBOT_NAME', ''))
+    ap.add_argument('--json', action='store_true', help='print JSON (device, ours, comparison) instead of the table')
+    ap.add_argument('--all', action='store_true', help='table: also list matching settings (default: mismatches + key items)')
+    args = ap.parse_args()
+
+    params, sources = load_ours(args.robot_name)
+    port = args.port or params.get('uartConf', {}).get('portName', '/dev/usv-sbg')
+    users = port_users(port)
+    if users:
+        sys.exit(f'{port} is open by {", ".join(users)} (sbg_driver?) — stop it first.')
+    baud = args.baud or int(params.get('uartConf', {}).get('baudRate', 921600))
+    port_id = int(params.get('uartConf', {}).get('portID', 0))
+
+    link = SbgLink(port, baud)
+    try:
+        device = read_device(link, port_id)
+    finally:
+        link.ser.close()
+    if 'error' in device.get('info', {}):
+        sys.exit(f'No answer from the SBG on {port} @ {baud} ({device["info"]["error"]}).')
+
+    expected = ours_expected(params)
+    rows = compare({k: v for k, v in device.items() if k not in ('info', 'extraBytes')}, expected)
+    stamp = datetime.datetime.now().astimezone().isoformat(timespec='seconds')
+    mismatches = [r for r in rows if r[3] in ('DIFF', '~float')]
+
+    if args.json:
+        print(json.dumps({'stamp': stamp, 'port': port, 'baud': baud, 'sources': sources, 'device': device,
+                          'ours': expected,
+                          'comparison': [dict(zip(('setting', 'device', 'ours', 'verdict'), r)) for r in rows],
+                          'mismatches': [r[0] for r in mismatches]}, indent=1, default=str))
+        return
+
+    i = device['info']
+    print(f'SBG {i["productCode"]}  S/N {i["serialNumber"]}  firmware {i["firmwareRev"]}  hardware {i["hardwareRev"]}  '
+          f'calibrated {i["calibrationDate"]}  — {port} @ {baud}, {stamp}')
+    print(f'ours: {sources["sbg_params"]} + {sources["vehicle_config"]} (robot {sources["robot_name"] or "-"})\n')
+    shown = rows if args.all else [r for r in rows if r[3] != 'ok' or r[0].startswith(('gnssInstallation', 'motionProfile'))
+                                   or (r[0].startswith('outputs.') and (r[1] or r[2]))]
+    w = max(len(r[0]) for r in shown)
+    print(f'  {"setting":<{w}}  {"device":<30} {"ours":<30} verdict')
+    for path, dev, our, verdict in shown:
+        print(f'  {path:<{w}}  {label(path, dev):<30} {label(path, our):<30} {verdict}')
+    if device.get('extraBytes'):
+        print('\nextra reply bytes (not interpreted): ' + ', '.join(f'{k}: {v}' for k, v in device['extraBytes'].items()))
+    na = sorted({r[0].split('.')[0] for r in rows if r[3] == 'n/a'})
+    print(f'\n{len(rows)} settings: {len(mismatches)} differ (driver rewrites + reboots at start), '
+          f'{sum(r[3] == "n/a" for r in rows)} not readable ({", ".join(na) or "-"}).'
+          + ('' if args.all else '  --all lists everything.'))
+    sys.exit(1 if mismatches else 0)
+
+
+if __name__ == '__main__':
+    main()

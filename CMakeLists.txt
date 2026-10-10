@@ -19,6 +19,7 @@ install(PROGRAMS
   utilities/ntrip_ros_client
   utilities/merge_sbg_params
   utilities/dual_antenna_attitude_remap
+  utilities/sbg_settings
   DESTINATION lib/${PROJECT_NAME}
 )
 
