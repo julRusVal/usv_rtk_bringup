@@ -25,11 +25,12 @@ extrinsics:
   gnss:
     child_frame: gnss
     # xyz: [0.0, 1.0, 0.0]   # primary antenna, 1 m port of IMU
-    xyz: [-0.38, 0.305, 0.1]   # primary antenna (measured)
+    xyz: [-0.38, 0.34, 0.1]    # primary antenna (measured; y re-measured 2026-10-16, was 0.305)
     rpy: [0.0, 0.0, 0.0]
   aux1:
     child_frame: aux1
-    xyz: [-0.38, -0.095, 0.1]  # secondary antenna (measured)
+    xyz: [-0.38, -0.14, 0.1]   # secondary antenna (measured; y re-measured 2026-10-16, was -0.095).
+                               # Baseline 0.48 m; the SBG measured 0.49 m with RTK outdoors
     rpy: [0.0, 0.0, 0.0]
   vsm:
     child_frame: vsm
