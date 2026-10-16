@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Heading check by a straight walk: RTK track bearing vs SBG EKF heading and raw dual-antenna heading.
+"""Straight-walk check: RTK track bearing vs SBG INS heading and raw dual-antenna heading; forward velocity sign
+(SBG body velocity, robot_localization local odometry) and the global EKF track (smarc/odom_in_map) vs the raw RTK track.
 
 Push the boat straight forward 10-15 m during the recording. Only RTK-fixed samples while moving count.
 Usage: ros2 run usv_rtk_bringup sbg_walk_heading [seconds]   (robot floatsam_usv_0)
 """
 import math, sys, time, rclpy
 from rclpy.qos import qos_profile_sensor_data
-from sbg_driver.msg import SbgGpsPos, SbgGpsHdt, SbgEkfQuat
+from nav_msgs.msg import Odometry
+from sbg_driver.msg import SbgGpsPos, SbgGpsHdt, SbgEkfQuat, SbgEkfVelBody
 
-N = '/floatsam_usv_0/sbg/sbg'
+ROBOT = '/floatsam_usv_0'
+N = ROBOT + '/sbg/sbg'
 R = 6378137.0
-pos, hdt, ekf = [], [], []
+pos, hdt, ekf, vbody, vlocal, odom_gps = [], [], [], [], [], []
 
 
 def compass_from_enu_quat(q):
@@ -32,6 +35,9 @@ n = rclpy.create_node('sbg_walk_heading')
 n.create_subscription(SbgGpsPos, N + '/gps_pos', lambda m: pos.append((time.time(), m.status.type, m.latitude, m.longitude)), qos_profile_sensor_data)
 n.create_subscription(SbgGpsHdt, N + '/gps_hdt', lambda m: hdt.append((time.time(), m.true_heading)), qos_profile_sensor_data)
 n.create_subscription(SbgEkfQuat, N + '/ekf_quat', lambda m: ekf.append((time.time(), compass_from_enu_quat(m.quaternion))), qos_profile_sensor_data)
+n.create_subscription(SbgEkfVelBody, N + '/ekf_vel_body', lambda m: vbody.append((time.time(), m.velocity.x)), qos_profile_sensor_data)
+n.create_subscription(Odometry, ROBOT + '/odometry/local', lambda m: vlocal.append((time.time(), m.twist.twist.linear.x)), qos_profile_sensor_data)
+n.create_subscription(Odometry, ROBOT + '/smarc/odom_in_map', lambda m: odom_gps.append((time.time(), m.pose.pose.position.x, m.pose.pose.position.y)), qos_profile_sensor_data)
 
 dur = float(sys.argv[1]) if len(sys.argv) > 1 else 60.0
 print(f'Recording {dur:.0f} s — push the boat straight forward 10-15 m now.', flush=True)
@@ -68,5 +74,17 @@ print(f'walk: {length:.2f} m in {t_end - t_start:.1f} s, max sideways {off:.2f} 
 print(f'RTK track bearing   {bearing:6.1f}°   (±{math.degrees(math.atan2(0.03, length)):.1f}° from 1.4 cm fixes)')
 print(f'SBG EKF heading     {h_ekf:6.1f}°   EKF - track {diff(h_ekf, bearing):+5.1f}°')
 print(f'raw HDT heading     {h_hdt:6.1f}°   HDT - track {diff(h_hdt, bearing):+5.1f}°')
+mean = lambda xs: sum(xs) / len(xs) if xs else float('nan')  # noqa: E731
+vb = mean([x for t, x in vbody if t_start <= t <= t_end]); vl = mean([x for t, x in vlocal if t_start <= t <= t_end])
+v_track = length / (t_end - t_start)
+print(f'forward speed: RTK track {v_track:.2f} m/s, SBG body vx {vb:+.2f}, local odometry vx {vl:+.2f}'
+      f' — {"sign OK" if vb > 0 and vl > 0 else "SIGN WRONG (expected > 0 moving forward)"}')
+# Global EKF (smarc/odom_in_map, map = ENU at the datum) vs RTK: compare the displacement over the walk, which is
+# independent of the datum offset.
+og = [p for p in odom_gps if t_start <= p[0] <= t_end]
+if len(og) >= 2:
+    ge, gn = og[-1][1] - og[0][1], og[-1][2] - og[0][2]
+    print(f'global EKF displacement ({ge:+.2f} E, {gn:+.2f} N) vs RTK ({de:+.2f} E, {dn:+.2f} N): '
+          f'difference {math.hypot(ge - de, gn - dn):.2f} m')
 if length < 8:
     print('NOTE: walk shorter than 8 m — bearing less certain')
