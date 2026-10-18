@@ -5,8 +5,9 @@
 Push the boat straight forward 10-15 m during the recording. Only RTK-fixed samples while moving count.
 Usage: ros2 run usv_rtk_bringup sbg_walk_heading [seconds]   (robot floatsam_usv_0)
 """
-import math, sys, time, rclpy
-from rclpy.qos import qos_profile_sensor_data
+import json, math, sys, time, rclpy
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from std_msgs.msg import String
 from nav_msgs.msg import Odometry
 from sbg_driver.msg import SbgGpsPos, SbgGpsHdt, SbgEkfQuat, SbgEkfVelBody
 
@@ -33,6 +34,9 @@ def diff(a, b):
 rclpy.init()
 n = rclpy.create_node('sbg_walk_heading')
 n.create_subscription(SbgGpsPos, N + '/gps_pos', lambda m: pos.append((time.time(), m.status.type, m.latitude, m.longitude)), qos_profile_sensor_data)
+settings = []
+n.create_subscription(String, ROBOT + '/sbg/device_settings', lambda m: settings.append(m.data),
+                      QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE))
 n.create_subscription(SbgGpsHdt, N + '/gps_hdt', lambda m: hdt.append((time.time(), m.true_heading)), qos_profile_sensor_data)
 n.create_subscription(SbgEkfQuat, N + '/ekf_quat', lambda m: ekf.append((time.time(), compass_from_enu_quat(m.quaternion))), qos_profile_sensor_data)
 n.create_subscription(SbgEkfVelBody, N + '/ekf_vel_body', lambda m: vbody.append((time.time(), m.velocity.x)), qos_profile_sensor_data)
@@ -69,11 +73,19 @@ bearing = math.degrees(math.atan2(de, dn)) % 360.0
 # Straightness: max distance of any point from the start-end line.
 off = max(abs((p[1] - seg[0][1]) * dn - (p[2] - seg[0][2]) * de) / length for p in seg) if length > 0 else float('nan')
 h_ekf = circ_mean([h for t, h in ekf if t_start <= t <= t_end])
-h_hdt = circ_mean([h for t, h in hdt if t_start <= t <= t_end])
+# gps_hdt.true_heading with use_enu is 90 - the device heading, and the device heading is the antenna baseline's
+# (primary -> secondary), so the boat's compass heading is 90 - published - the baseline's angle from the bow, taken
+# from the SBG's own antenna layout (FRD lever arms; 90 with the secondary on the starboard side).
+try:
+    g = json.loads(settings[-1])['device']['gnssInstallation']
+    base = math.degrees(math.atan2(g['secondaryY'] - g['primaryY'], g['secondaryX'] - g['primaryX']))
+except (IndexError, KeyError, ValueError):
+    sys.exit('no sbg/device_settings (latched, from the SBG bringup): cannot convert the dual-antenna heading')
+h_hdt = circ_mean([(90.0 - h - base) % 360.0 for t, h in hdt if t_start <= t <= t_end])
 print(f'walk: {length:.2f} m in {t_end - t_start:.1f} s, max sideways {off:.2f} m (straightness)')
 print(f'RTK track bearing   {bearing:6.1f}°   (±{math.degrees(math.atan2(0.03, length)):.1f}° from 1.4 cm fixes)')
 print(f'SBG EKF heading     {h_ekf:6.1f}°   EKF - track {diff(h_ekf, bearing):+5.1f}°')
-print(f'raw HDT heading     {h_hdt:6.1f}°   HDT - track {diff(h_hdt, bearing):+5.1f}°')
+print(f'dual-antenna heading{h_hdt:6.1f}°   dual - track {diff(h_hdt, bearing):+5.1f}°   (baseline {base:.0f}° from the bow)')
 mean = lambda xs: sum(xs) / len(xs) if xs else float('nan')  # noqa: E731
 vb = mean([x for t, x in vbody if t_start <= t <= t_end]); vl = mean([x for t, x in vlocal if t_start <= t <= t_end])
 v_track = length / (t_end - t_start)
